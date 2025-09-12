@@ -20,7 +20,7 @@ jobs:
       - name: Download Zig
         run: |
           wget $ZIG_URL -O zig.tar.xz
-          tar -xf zig.tar.xz
+          tar -xf zig.tar.xz --strip-components=1 -C zig
           echo "$(pwd)/zig" >> $GITHUB_PATH
 
       - name: Build with Zig
