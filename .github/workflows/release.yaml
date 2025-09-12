@@ -50,51 +50,36 @@ jobs:
 
       - name: Generate Changelog Since Previous Tag
         id: changelog
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { repo, ref } = context;
-            const currentTag = ref.replace('refs/tags/', '');
+        run: |
+          set -e
+          current_tag="${GITHUB_REF#refs/tags/}"
+          tags=$(git tag --sort=-creatordate)
+          prev_tag=""
+          found=""
+          for tag in $tags; do
+            if [ "$found" = "yes" ]; then
+              prev_tag="$tag"
+              break
+            fi
+            if [ "$tag" = "$current_tag" ]; then
+              found="yes"
+            fi
+          done
 
-            // Get all tags, sorted by creation date descending
-            const tags = await github.rest.repos.listTags({
-              owner: repo.owner,
-              repo: repo.repo,
-              per_page: 100
-            });
-
-            // Find previous tag (the one before the current tag)
-            let prevTag = null;
-            for (let i = 0; i < tags.data.length; i++) {
-              if (tags.data[i].name === currentTag && i + 1 < tags.data.length) {
-                prevTag = tags.data[i + 1].name;
-                break;
-              }
-            }
-
-            let changelog = `## Changelog\n`;
-            if (prevTag) {
-              // Get commits between prevTag and currentTag
-              const compare = await github.rest.repos.compareCommits({
-                owner: repo.owner,
-                repo: repo.repo,
-                base: prevTag,
-                head: currentTag
-              });
-              for (const commit of compare.data.commits) {
-                changelog += `- ${commit.commit.message} ([${commit.sha.substring(0,7)}](${commit.html_url}))\n`;
-              }
-            } else {
-              changelog += 'First release or previous tag not found.\n';
-            }
-            return changelog;
+          echo "## Changelog" > CHANGELOG.md
+          if [ -n "$prev_tag" ]; then
+            git log --pretty=format:"- %s ([%h](https://github.com/${GITHUB_REPOSITORY}/commit/%H))" "$prev_tag..$current_tag" >> CHANGELOG.md
+          else
+            echo "First release or previous tag not found." >> CHANGELOG.md
+          fi
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: zig-out/*.tgz
-          body: ${{ steps.changelog.outputs.result }}
+          body_path: CHANGELOG.md
           make_latest: true
+          name: blackcat ${{ steps.set_tag.outputs.tag }}
           tag_name: ${{ steps.set_tag.outputs.tag }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
