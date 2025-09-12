@@ -584,7 +584,7 @@ fn renderImage(file: *std.fs.File, writer: anytype) !void {
     var term_cols: u16 = 80;
     var term_rows: u16 = 24;
     var winsize: Winsize = undefined;
-    if (std.posix.system.ioctl(1, std.posix.system.T.IOCGWINSZ, &winsize) == 0) {
+    if (std.posix.system.ioctl(1, std.posix.system.T.IOCGWINSZ, @intFromPtr(&winsize)) == 0) {
         term_cols = winsize.ws_col;
         term_rows = winsize.ws_row;
     }
