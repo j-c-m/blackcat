@@ -283,6 +283,21 @@ const AnsiTerminal = struct {
     }
 };
 
+// --- CRLF detection helper ---
+fn has_crlf(buf: []const u8) bool {
+    var last_was_cr = false;
+    for (buf) |b| {
+        if (last_was_cr and b == '\n') {
+            return true;
+        } else if (b == '\r') {
+            last_was_cr = true;
+        } else {
+            last_was_cr = false;
+        }
+    }
+    return false;
+}
+
 // --- ANSI detection helper ---
 fn sampleForAnsi(reader: anytype, options_ansi: bool) !bool {
     var sample_buf: [4096]u8 = undefined;
@@ -292,15 +307,17 @@ fn sampleForAnsi(reader: anytype, options_ansi: bool) !bool {
         return options_ansi;
     }
 
+    var has_ansi = false;
     var i: usize = 0;
-    while (i + 1 < sample_len) : (i += 1) {
-        if (sample_buf[i] == 0x1B and sample_buf[i + 1] == '[') {
-            _ = reader.context.seekTo(0) catch {};
-            return true;
+    while (i < sample_len) : (i += 1) {
+        const b = sample_buf[i];
+        if (i + 1 < sample_len and b == 0x1B and sample_buf[i + 1] == '[') {
+            has_ansi = true;
+            break;
         }
     }
     _ = reader.context.seekTo(0) catch {};
-    return options_ansi;
+    return options_ansi or (has_ansi and has_crlf(sample_buf[0..sample_len]));
 }
 
 fn sampleForCp437(reader: anytype, options_cp437: bool) !bool {
@@ -311,22 +328,15 @@ fn sampleForCp437(reader: anytype, options_cp437: bool) !bool {
         return options_cp437;
     }
 
-    var has_crlf = false;
     var has_high_byte = false;
-    var last_was_cr = false;
     for (sample_buf[0..sample_len]) |b| {
-        if (b >= 128) has_high_byte = true;
-        if (last_was_cr and b == '\n') {
-            has_crlf = true;
-            if (has_crlf and has_high_byte) break;
-        } else if (b == '\r') {
-            last_was_cr = true;
-        } else {
-            last_was_cr = false;
+        if (b >= 128) {
+            has_high_byte = true;
+            break;
         }
     }
     _ = reader.context.seekTo(0) catch {};
-    return options_cp437 or (has_crlf and has_high_byte);
+    return options_cp437 or (has_high_byte and has_crlf(sample_buf[0..]));
 }
 
 pub fn main() !void {
@@ -472,7 +482,7 @@ fn catFile(
     var detected_ansi: bool = options.ansi;
     if (!is_stdin) {
         detected_cp437 = try sampleForCp437(reader, options.cp437);
-        if (detected_cp437) detected_ansi = try sampleForAnsi(reader, options.ansi);
+        detected_ansi = try sampleForAnsi(reader, options.ansi);
     }
 
     // Image detection (only for files, not stdin)
@@ -652,7 +662,6 @@ fn renderImage(file: *std.fs.File, writer: anytype) !void {
 
 // Bilinear image resizing
 fn resizeImage(alloc: std.mem.Allocator, img: *zigimg.Image, new_w: u32, new_h: u32) !void {
-
     if (img.pixelFormat() != .rgba32) {
         try img.convert(.rgba32);
     }
