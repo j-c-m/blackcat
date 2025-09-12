@@ -1,0 +1,17 @@
+.{
+    .name = .blackcat,
+    .version = "0.1.0",
+    .fingerprint = 0x2bf865e42216aa17, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{
+        .zigimg = .{
+            .url = "git+https://github.com/zigimg/zigimg.git#70a3abe922d65ec13b488b0890970edcf11e0006",
+            .hash = "zigimg-0.1.0-8_eo2oFJEwDQjDFXp7mdV7KXQiMIRAYCl7Y0z91NdxG2",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
