@@ -51,7 +51,7 @@ fn build_release(
         .{ .cpu_arch = .x86_64, .os_tag = .macos },
         .{ .cpu_arch = .aarch64, .os_tag = .macos },
     };
-    const optimize = .ReleaseFast;
+    const optimize = .ReleaseSmall;
 
     var version = std.ArrayList(u8).init(b.allocator);
     defer version.deinit();
