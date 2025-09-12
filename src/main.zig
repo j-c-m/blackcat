@@ -132,7 +132,7 @@ const AnsiTerminal = struct {
         while (self.cursor_y >= self.screen.items.len) {
             var row = std.ArrayList(ScreenCell).init(self.allocator);
             for (0..self.width) |_| {
-                row.append(ScreenCell{ .ch = ' ', .fg = null, .bg = null, .bold = false, .blink = false }) catch {};
+                row.append(ScreenCell{ .ch = ' ', .fg = null, .bg = 0, .bold = false, .blink = false }) catch {};
             }
             self.screen.append(row) catch return;
         }
