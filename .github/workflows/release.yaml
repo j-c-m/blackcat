@@ -93,5 +93,6 @@ jobs:
           files: zig-out/*.tgz
           body: ${{ steps.changelog.outputs.result }}
           make_latest: true
+          tag_name: ${{ steps.set_tag.outputs.tag }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
