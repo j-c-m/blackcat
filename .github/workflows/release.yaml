@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    env:
+      ZIG_VERSION: 0.14.1
+      ZIG_URL: https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Zig
+        run: |
+          wget $ZIG_URL -O zig.tar.xz
+          tar -xf zig.tar.xz
+          echo "$(pwd)/zig" >> $GITHUB_PATH
+
+      - name: Build with Zig
+        run: |
+          zig/zig build -Dpackage_release=true
+
+      - name: Package binaries
+        run: |
+          cd zig-out
+          for dir in *; do
+            if [ -d "$dir" ]; then
+              tar -czvf "$dir.tgz" -C "$dir" .
+            fi
+          done
+
+      - name: Generate Changelog Since Previous Tag
+        id: changelog
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { repo, ref } = context;
+            const currentTag = ref.replace('refs/tags/', '');
+
+            // Get all tags, sorted by creation date descending
+            const tags = await github.rest.repos.listTags({
+              owner: repo.owner,
+              repo: repo.repo,
+              per_page: 100
+            });
+
+            // Find previous tag (the one before the current tag)
+            let prevTag = null;
+            for (let i = 0; i < tags.data.length; i++) {
+              if (tags.data[i].name === currentTag && i + 1 < tags.data.length) {
+                prevTag = tags.data[i + 1].name;
+                break;
+              }
+            }
+
+            let changelog = `## Changelog\n`;
+            if (prevTag) {
+              // Get commits between prevTag and currentTag
+              const compare = await github.rest.repos.compareCommits({
+                owner: repo.owner,
+                repo: repo.repo,
+                base: prevTag,
+                head: currentTag
+              });
+              for (const commit of compare.data.commits) {
+                changelog += `- ${commit.commit.message} ([${commit.sha.substring(0,7)}](${commit.html_url}))\n`;
+              }
+            } else {
+              changelog += 'First release or previous tag not found.\n';
+            }
+            return changelog;
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: zig-out/*.tgz
+          body: ${{ steps.changelog.outputs.result }}
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
