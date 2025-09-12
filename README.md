@@ -5,6 +5,7 @@ A modern cat written in Zig (https://ziglang.org)
 * Support for Kitty graphics protocol
 * Support for ANSI terminal rendering mode (auto-detected)
 * Support for CP437 to Unicode conversion (auto-detected)
+* Mostly GNU cat compatible otherwise
 
 ## Usage
 
