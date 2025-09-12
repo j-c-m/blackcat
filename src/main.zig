@@ -565,10 +565,8 @@ fn renderImage(file: *std.fs.File, writer: anytype) !void {
     var img = try zigimg.Image.fromFile(allocator, file);
     defer img.deinit();
 
-    // Seek to start if needed, assuming file is seekable
     _ = file.seekTo(0) catch {};
 
-    // Get original dimensions
     const original_width = img.width;
     const original_height = img.height;
 
@@ -581,7 +579,6 @@ fn renderImage(file: *std.fs.File, writer: anytype) !void {
         term_rows = winsize.ws_row;
     }
 
-    // Constants
     const CELL_WIDTH: f32 = 8.0;
     const CELL_HEIGHT: f32 = 16.0;
 
@@ -594,33 +591,18 @@ fn renderImage(file: *std.fs.File, writer: anytype) !void {
     const img_h: f32 = @floatFromInt(original_height);
     const scale_x: f32 = max_pixel_w / img_w;
     const scale_y: f32 = max_pixel_h / img_h;
-    const scale: f32 = @min(scale_x, scale_y, 1.0);
+    const scale: f32 = @min(scale_x, scale_y);
 
     // New dimensions
     const new_w: u32 = @intFromFloat(scale * img_w);
     const new_h: u32 = @intFromFloat(scale * img_h);
 
-    // Convert to RGBA
+    // Convert to RGBA (kitty f=32)
     try img.convert(.rgba32);
 
     // Resize if needed
-    if (new_w != original_width or new_h != original_height) {
-        const pixel_count = new_w * new_h;
-        var new_pixels = try allocator.alloc(zigimg.color.Rgba32, pixel_count);
-        var idx: usize = 0;
-        for (0..new_h) |y| {
-            for (0..new_w) |x| {
-                const src_x = (x * @as(usize, original_width)) / @as(usize, new_w);
-                const src_y = (y * @as(usize, original_height)) / @as(usize, new_h);
-                const pixel = img.pixels.rgba32[src_y * original_width + src_x];
-                new_pixels[idx] = pixel;
-                idx += 1;
-            }
-        }
-        allocator.free(img.pixels.rgba32);
-        img.pixels = .{ .rgba32 = new_pixels };
-        img.width = new_w;
-        img.height = new_h;
+    if (new_w < original_width or new_h < original_height) {
+        try resizeImage(allocator, &img, new_w, new_h);
     }
 
     // Prepare byte array for RGBA data
@@ -633,14 +615,14 @@ fn renderImage(file: *std.fs.File, writer: anytype) !void {
         try byte_data.append(px.a);
     }
 
-    // Encode RGBA byte data to base64
+    // Encode RGBA byte data to base64 for kitty
     var encoded = std.ArrayList(u8).init(allocator);
     defer encoded.deinit();
     const out_len = std.base64.standard.Encoder.calcSize(byte_data.items.len);
     try encoded.resize(out_len);
     _ = std.base64.standard.Encoder.encode(encoded.items, byte_data.items);
 
-    try writer.print("\n", .{});
+    try writer.print("\n     ", .{});
     // Output Kitty sequence in 4096 byte chunks
     const chunk_size = 4096;
     const data = encoded.items;
@@ -657,13 +639,73 @@ fn renderImage(file: *std.fs.File, writer: anytype) !void {
         // Middle chunks with m=1
         while (start + chunk_size < data.len) {
             const end = start + chunk_size;
-            try writer.print("\x1B_Gm=1;{s}\x1B\\", .{ data[start..end] });
+            try writer.print("\x1B_Gm=1;{s}\x1B\\", .{data[start..end]});
             start = end;
         }
         // Last chunk with m=0
         if (start < data.len) {
-            try writer.print("\x1B_Gm=0;{s}\x1B\\", .{ data[start..] });
+            try writer.print("\x1B_Gm=0;{s}\x1B\\", .{data[start..]});
         }
     }
     try writer.print("\n\n", .{});
+}
+
+// Bilinear image resizing
+fn resizeImage(alloc: std.mem.Allocator, img: *zigimg.Image, new_w: u32, new_h: u32) !void {
+
+    if (img.pixelFormat() != .rgba32) {
+        try img.convert(.rgba32);
+    }
+
+    const original_width = img.width;
+    const original_height = img.height;
+
+    if (new_w == original_width and new_h == original_height) {
+        return;
+    }
+
+    const img_w_f = @as(f32, @floatFromInt(original_width));
+    const img_h_f = @as(f32, @floatFromInt(original_height));
+    const new_w_f = @as(f32, @floatFromInt(new_w));
+    const new_h_f = @as(f32, @floatFromInt(new_h));
+
+    var new_pixels = try alloc.alloc(zigimg.color.Rgba32, new_w * new_h);
+
+    for (0..new_h) |y| {
+        const sy = @as(f32, @floatFromInt(y)) * img_h_f / new_h_f;
+        const y0 = @as(usize, @intFromFloat(@floor(sy)));
+        const y1 = @min(y0 + 1, original_height - 1);
+        const dy = sy - @floor(sy);
+
+        for (0..new_w) |x| {
+            const sx = @as(f32, @floatFromInt(x)) * img_w_f / new_w_f;
+            const x0 = @as(usize, @intFromFloat(@floor(sx)));
+            const x1 = @min(x0 + 1, original_width - 1);
+            const dx = sx - @floor(sx);
+
+            const p00 = img.pixels.rgba32[@as(usize, y0) * original_width + x0];
+            const p01 = img.pixels.rgba32[@as(usize, y0) * original_width + x1];
+            const p10 = img.pixels.rgba32[@as(usize, y1) * original_width + x0];
+            const p11 = img.pixels.rgba32[@as(usize, y1) * original_width + x1];
+
+            const r = (1 - dx) * (1 - dy) * @as(f32, @floatFromInt(p00.r)) + dx * (1 - dy) * @as(f32, @floatFromInt(p01.r)) + (1 - dx) * dy * @as(f32, @floatFromInt(p10.r)) + dx * dy * @as(f32, @floatFromInt(p11.r));
+            const g = (1 - dx) * (1 - dy) * @as(f32, @floatFromInt(p00.g)) + dx * (1 - dy) * @as(f32, @floatFromInt(p01.g)) + (1 - dx) * dy * @as(f32, @floatFromInt(p10.g)) + dx * dy * @as(f32, @floatFromInt(p11.g));
+            const b = (1 - dx) * (1 - dy) * @as(f32, @floatFromInt(p00.b)) + dx * (1 - dy) * @as(f32, @floatFromInt(p01.b)) + (1 - dx) * dy * @as(f32, @floatFromInt(p10.b)) + dx * dy * @as(f32, @floatFromInt(p11.b));
+            const a = (1 - dx) * (1 - dy) * @as(f32, @floatFromInt(p00.a)) + dx * (1 - dy) * @as(f32, @floatFromInt(p01.a)) + (1 - dx) * dy * @as(f32, @floatFromInt(p10.a)) + dx * dy * @as(f32, @floatFromInt(p11.a));
+
+            new_pixels[y * new_w + x] = .{
+                .r = @intFromFloat(@round(r)),
+                .g = @intFromFloat(@round(g)),
+                .b = @intFromFloat(@round(b)),
+                .a = @intFromFloat(@round(a)),
+            };
+        }
+    }
+
+    alloc.free(img.pixels.rgba32);
+    img.pixels = .{ .rgba32 = new_pixels };
+    img.width = new_w;
+    img.height = new_h;
+
+    return;
 }
