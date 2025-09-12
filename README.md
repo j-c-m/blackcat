@@ -2,9 +2,9 @@
 
 A modern cat written in Zig (https://ziglang.org)
 
-* Support for Kitty graphics protocol
+* Support Kitty graphics protocol for displaying images in supported terminals. (https://sw.kovidgoyal.net/kitty/graphics-protocol/)
 * Support for ANSI terminal rendering mode (auto-detected)
-* Support for CP437 to Unicode conversion (auto-detected)
+* Support for CP437/DOS to Unicode conversion (auto-detected)
 * Mostly GNU cat compatible otherwise
 
 ## Usage
