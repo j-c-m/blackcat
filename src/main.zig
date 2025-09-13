@@ -240,7 +240,6 @@ const AnsiTerminal = struct {
     pub fn renderReader(allocator: std.mem.Allocator, reader: anytype, writer: anytype, width: usize) !void {
         var content = std.ArrayList(u8).init(allocator);
         defer content.deinit();
-        var buf: [4096]u8 = undefined;
         while (true) {
             const len = try reader.read(&buf);
             if (len == 0) break;
@@ -284,9 +283,9 @@ const AnsiTerminal = struct {
 };
 
 // --- CRLF detection helper ---
-fn has_crlf(buf: []const u8) bool {
+fn has_crlf(lbuf: []const u8) bool {
     var last_was_cr = false;
-    for (buf) |b| {
+    for (lbuf) |b| {
         if (last_was_cr and b == '\n') {
             return true;
         } else if (b == '\r') {
@@ -299,45 +298,31 @@ fn has_crlf(buf: []const u8) bool {
 }
 
 // --- ANSI detection helper ---
-fn sampleForAnsi(reader: anytype, options_ansi: bool) !bool {
-    var sample_buf: [4096]u8 = undefined;
-    const sample_len = try reader.read(sample_buf[0..]);
-    if (sample_len == 0) {
-        _ = reader.context.seekTo(0) catch {};
-        return options_ansi;
-    }
-
+fn sampleForAnsi(head_buf: []const u8) !bool {
     var has_ansi = false;
     var i: usize = 0;
-    while (i < sample_len) : (i += 1) {
-        const b = sample_buf[i];
-        if (i + 1 < sample_len and b == 0x1B and sample_buf[i + 1] == '[') {
+    while (i < head_buf.len) : (i += 1) {
+        const b = head_buf[i];
+        if (i + 1 < head_buf.len and b == 0x1B and head_buf[i + 1] == '[') {
             has_ansi = true;
             break;
         }
     }
-    _ = reader.context.seekTo(0) catch {};
-    return options_ansi or (has_ansi and has_crlf(sample_buf[0..sample_len]));
+    return has_ansi and has_crlf(head_buf[0..]);
 }
 
-fn sampleForCp437(reader: anytype, options_cp437: bool) !bool {
-    var sample_buf: [4096]u8 = undefined;
-    const sample_len = try reader.read(sample_buf[0..]);
-    if (sample_len == 0) {
-        _ = reader.context.seekTo(0) catch {};
-        return options_cp437;
-    }
-
+fn sampleForCp437(head_buf: []const u8) !bool {
     var has_high_byte = false;
-    for (sample_buf[0..sample_len]) |b| {
+    for (head_buf[0..]) |b| {
         if (b >= 128) {
             has_high_byte = true;
             break;
         }
     }
-    _ = reader.context.seekTo(0) catch {};
-    return options_cp437 or (has_high_byte and has_crlf(sample_buf[0..]));
+    return has_high_byte and has_crlf(head_buf[0..]);
 }
+
+var buf: [131072]u8 = undefined;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -471,7 +456,6 @@ fn catFile(
     }
     defer if (file_opened) file.close();
 
-    var buf: [65535]u8 = undefined;
     var line_buf = std.ArrayList(u8).init(std.heap.page_allocator);
     defer line_buf.deinit();
 
@@ -480,17 +464,35 @@ fn catFile(
 
     var detected_cp437: bool = options.cp437;
     var detected_ansi: bool = options.ansi;
+    var head_buf: [512]u8 = undefined;
+
+    const len = try reader.read(&head_buf);
+    if (len == 0) {
+        return;
+    }
+
     if (!is_stdin) {
-        detected_cp437 = try sampleForCp437(reader, options.cp437);
-        detected_ansi = try sampleForAnsi(reader, options.ansi);
+        if(!options.cp437) detected_cp437 = try sampleForCp437(&head_buf);
+        if(!options.ansi) detected_ansi = try sampleForAnsi(&head_buf);
     }
 
     // Image detection (only for files, not stdin)
     if (!is_stdin and !options.kitty) {
-        if (try isImageFile(reader)) {
+        if (try isImageFile(&head_buf)) {
             try renderImage(&file, writer);
             return;
         }
+    }
+
+    if(!detected_ansi and !detected_ansi and !options.show_ends and
+        !options.show_tabs and !options.show_nonprinting and
+        !options.number and !options.number_nonblank and
+        !options.squeeze_blank and !options.ansi and !options.cp437 and
+        !detected_cp437 and !detected_ansi and
+        !is_stdin)
+    {
+        try fastCat(&file, writer);
+        return;
     }
 
     while (true) {
@@ -535,11 +537,11 @@ fn catFile(
                     try writer.writeAll("^?");
                 }
             } else {
-                if (detected_cp437) {
+                if (detected_cp437 or options.cp437) {
                     if (c == 0x1A) return;
                     var cbuf: [4]u8 = undefined;
-                    const len = try std.unicode.utf8Encode(cp437_to_unicode[c], &cbuf);
-                    try writer.writeAll(cbuf[0..len]);
+                    const clen = try std.unicode.utf8Encode(cp437_to_unicode[c], &cbuf);
+                    try writer.writeAll(cbuf[0..clen]);
                 } else {
                     try writer.writeByte(c);
                 }
@@ -551,15 +553,20 @@ fn catFile(
         try writer.writeByte('\n');
         try line_buf.resize(0);
     }
+
 }
 
-fn isImageFile(reader: anytype) !bool {
-    var buf: [512]u8 = undefined;
-    const len = try reader.read(&buf);
-    if (len == 0) return false;
-    // Seek back for later use
-    _ = reader.context.seekTo(0) catch {};
-    _ = zigimg.Image.detectFormatFromMemory(buf[0..len]) catch return false;
+fn fastCat(file: *std.fs.File, writer: anytype) !void {
+    var reader = file.reader();
+    while (true) {
+        const len = try reader.read(&buf);
+        if (len == 0) break;
+        try writer.writeAll(buf[0..len]);
+    }
+}
+
+fn isImageFile(head_buf: []const u8) !bool {
+    _ = zigimg.Image.detectFormatFromMemory(head_buf[0..]) catch return false;
     return true;
 }
 
