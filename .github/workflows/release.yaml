@@ -18,6 +18,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set Release Tag or SHA
         id: set_tag
@@ -52,7 +54,7 @@ jobs:
         id: changelog
         run: |
           set -e
-          current_tag="${GITHUB_REF#refs/tags/}"
+          current_tag="${{ steps.set_tag.outputs.tag }}"
           tags=$(git tag --sort=-creatordate)
           prev_tag=""
           found=""
