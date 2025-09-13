@@ -31,7 +31,7 @@ const Usage =
     \\
 ;
 
-const Version = "0.2.1";
+const Version = "0.2.2";
 
 const cp437_to_unicode = [_]u21{
     // 0-127
@@ -240,9 +240,9 @@ const AnsiTerminal = struct {
         var content = std.ArrayList(u8).init(allocator);
         defer content.deinit();
         while (true) {
-            const len = try reader.read(&buf);
+            const len = try reader.read(&catbuf);
             if (len == 0) break;
-            try content.appendSlice(buf[0..len]);
+            try content.appendSlice(catbuf[0..len]);
         }
         var term = AnsiTerminal.init(allocator, width);
         defer term.deinit();
@@ -321,7 +321,7 @@ fn sampleForCp437(head_buf: []const u8) !bool {
     return has_high_byte and has_crlf(head_buf[0..]);
 }
 
-var buf: [131072]u8 = undefined;
+var catbuf: [131072]u8 = undefined;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -347,103 +347,126 @@ pub fn main() !void {
 
     var files = std.ArrayList([]const u8).init(allocator);
 
+    var processing_options = true;
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--help")) {
-            try stdout.print(Usage, .{prog_name});
-            return;
-        }
-        if (std.mem.eql(u8, arg, "--version")) {
-            try stdout.print("blackcat {s}\n", .{Version});
-            return;
-        }
-        if (std.mem.startsWith(u8, arg, "--ansi=")) {
-            const width_str = arg[7..];
-            options.ansi_width = std.fmt.parseInt(usize, width_str, 10) catch 80;
-            options.ansi = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--ansi")) {
-            options.ansi = true;
-            options.ansi_width = 80;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--show-all")) {
-            options.show_ends = true;
-            options.show_tabs = true;
-            options.show_nonprinting = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--number-nonblank")) {
-            options.number_nonblank = true;
-            options.number = false;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--cp437")) {
-            options.cp437 = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--show-ends")) {
-            options.show_ends = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--no-images")) {
-            options.kitty = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--number")) {
-            if (!options.number_nonblank) options.number = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--squeeze-blank")) {
-            options.squeeze_blank = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--show-tabs")) {
-            options.show_tabs = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--show-nonprinting")) {
-            options.show_nonprinting = true;
-            continue;
-        }
-        // Combined short options
-        if (std.mem.startsWith(u8, arg, "-") and arg.len > 1 and arg[1] != '-') {
-            const shorts = arg[1..];
-            for (shorts) |opt| {
-                switch (opt) {
-                    'a' => {
-                        options.ansi = true;
-                        options.ansi_width = 80;
-                    },
-                    'A' => {
-                        options.show_ends = true;
-                        options.show_tabs = true;
-                        options.show_nonprinting = true;
-                    },
-                    'b' => {
-                        options.number_nonblank = true;
-                        options.number = false;
-                    },
-                    'c' => { options.cp437 = true; },
-                    'e' => {
-                        options.show_ends = true;
-                        options.show_nonprinting = true;
-                    },
-                    'E' => { options.show_ends = true; },
-                    'k' => { options.kitty = true; },
-                    'n' => { if (!options.number_nonblank) options.number = true; },
-                    's' => { options.squeeze_blank = true; },
-                    't' => {
-                        options.show_tabs = true;
-                        options.show_nonprinting = true;
-                    },
-                    'T' => { options.show_tabs = true; },
-                    'u' => {}, // ignored
-                    'v' => { options.show_nonprinting = true; },
-                    else => {},
-                }
+        if (processing_options) {
+            if (std.mem.eql(u8, arg, "--")) {
+                processing_options = false;
+                continue;
             }
-            continue;
+            if (std.mem.eql(u8, arg, "--help")) {
+                try stdout.print(Usage, .{prog_name});
+                return;
+            }
+            if (std.mem.eql(u8, arg, "--version")) {
+                try stdout.print("blackcat {s}\n", .{Version});
+                return;
+            }
+            if (std.mem.startsWith(u8, arg, "--ansi=")) {
+                const width_str = arg[7..];
+                options.ansi_width = std.fmt.parseInt(usize, width_str, 10) catch 80;
+                options.ansi = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--ansi")) {
+                options.ansi = true;
+                options.ansi_width = 80;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--show-all")) {
+                options.show_ends = true;
+                options.show_tabs = true;
+                options.show_nonprinting = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--number-nonblank")) {
+                options.number_nonblank = true;
+                options.number = false;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--cp437")) {
+                options.cp437 = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--show-ends")) {
+                options.show_ends = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--no-images")) {
+                options.kitty = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--number")) {
+                if (!options.number_nonblank) options.number = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--squeeze-blank")) {
+                options.squeeze_blank = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--show-tabs")) {
+                options.show_tabs = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--show-nonprinting")) {
+                options.show_nonprinting = true;
+                continue;
+            }
+            // Combined short options
+            if (std.mem.startsWith(u8, arg, "-") and arg.len > 1 and arg[1] != '-') {
+                const shorts = arg[1..];
+                for (shorts) |opt| {
+                    switch (opt) {
+                        'a' => {
+                            options.ansi = true;
+                            options.ansi_width = 80;
+                        },
+                        'A' => {
+                            options.show_ends = true;
+                            options.show_tabs = true;
+                            options.show_nonprinting = true;
+                        },
+                        'b' => {
+                            options.number_nonblank = true;
+                            options.number = false;
+                        },
+                        'c' => {
+                            options.cp437 = true;
+                        },
+                        'e' => {
+                            options.show_ends = true;
+                            options.show_nonprinting = true;
+                        },
+                        'E' => {
+                            options.show_ends = true;
+                        },
+                        'k' => {
+                            options.kitty = true;
+                        },
+                        'n' => {
+                            if (!options.number_nonblank) options.number = true;
+                        },
+                        's' => {
+                            options.squeeze_blank = true;
+                        },
+                        't' => {
+                            options.show_tabs = true;
+                            options.show_nonprinting = true;
+                        },
+                        'T' => {
+                            options.show_tabs = true;
+                        },
+                        'u' => {}, // ignored
+                        'v' => {
+                            options.show_nonprinting = true;
+                        },
+                        else => {},
+                    }
+                }
+                continue;
+            }
+            // If we reach here, it's not an option, so stop processing options and treat as file
+            processing_options = false;
         }
         // treat as file
         try files.append(arg);
@@ -481,11 +504,7 @@ fn catFile(
     }
     defer if (file_opened) file.close();
 
-    var line_buf = std.ArrayList(u8).init(std.heap.page_allocator);
-    defer line_buf.deinit();
-
     var line_num: usize = 1;
-    var prev_blank = false;
 
     var detected_cp437: bool = options.cp437;
     var detected_ansi: bool = options.ansi;
@@ -500,8 +519,8 @@ fn catFile(
     }
 
     if (!is_stdin) {
-        if(!options.cp437) detected_cp437 = try sampleForCp437(&head_buf);
-        if(!options.ansi) detected_ansi = try sampleForAnsi(&head_buf);
+        if (!options.cp437) detected_cp437 = try sampleForCp437(&head_buf);
+        if (!options.ansi) detected_ansi = try sampleForAnsi(&head_buf);
     }
 
     // Image detection (only for files, not stdin)
@@ -512,83 +531,104 @@ fn catFile(
         }
     }
 
-    if(!detected_ansi and !detected_cp437 and !options.show_ends and
+    if (detected_ansi) {
+        try AnsiTerminal.renderReader(std.heap.page_allocator, reader, writer, options.ansi_width);
+        return;
+    }
+
+    if (!detected_ansi and !detected_cp437 and !options.show_ends and
         !options.show_tabs and !options.show_nonprinting and
         !options.number and !options.number_nonblank and
-        !options.squeeze_blank and !options.ansi and !options.cp437 and
-        !is_stdin)
+        !options.squeeze_blank and !is_stdin)
     {
         try fastCat(&file, writer);
         return;
     }
 
+    var prev: u8 = '\n';
+    var squeeze: bool = false;
+
     while (true) {
-        if (detected_ansi) {
-            try AnsiTerminal.renderReader(std.heap.page_allocator, reader, writer, options.ansi_width);
-            return;
-        }
-        const slice = try reader.readUntilDelimiterOrEof(buf[0..], '\n');
-        if (slice == null) break;
-        const s = slice.?;
-        try line_buf.appendSlice(s);
-        if (s.len > 0 and s[s.len - 1] == '\r') _ = line_buf.pop();
-        const line = line_buf.items;
-        const is_blank = line.len == 0;
+        const len = try reader.read(&catbuf);
+        if (len == 0) break;
+        for (catbuf[0..len]) |ch| {
+            if (prev == '\n') {
+                if (options.squeeze_blank) {
+                    if (ch == '\n') {
+                        if (squeeze) {
+                            continue;
+                        }
+                        squeeze = true;
+                    } else squeeze = false;
+                }
 
-        if (options.squeeze_blank) {
-            if (is_blank and prev_blank) {
-                try line_buf.resize(0);
-                continue;
+                if (options.number and !options.number_nonblank) {
+                    try writer.print("{d:>6}  ", .{line_num});
+                    line_num += 1;
+                } else if (options.number_nonblank and ch != '\n') {
+                    try writer.print("{d:>6}  ", .{line_num});
+                    line_num += 1;
+                }
             }
-            prev_blank = is_blank;
-        }
 
-        if (options.number) {
-            try writer.print("{d:>6}  ", .{line_num});
-            line_num += 1;
-        } else if (options.number_nonblank and !is_blank) {
-            try writer.print("{d:>6}  ", .{line_num});
-            line_num += 1;
-        }
+            if (options.show_ends) {
+                if (ch == '\r') {
+                    prev = ch;
+                    continue;
+                }
+                if (ch == '\n') {
+                    if (prev == '\r') {
+                        try writer.writeAll("^M");
+                    }
+                    try writer.writeAll("$");
+                }
+                if (prev == '\r' and ch != '\n') {
+                    try writer.writeByte('\r');
+                }
+            }
 
-        var i: usize = 0;
-        while (i < line.len) : (i += 1) {
-            const c = line[i];
-            if (c == '\t' and options.show_tabs) {
+            if (options.show_ends and prev == '\r' and ch != '\n') {
+                try writer.writeByte('\r');
+            }
+
+            if (ch == '\t' and options.show_tabs) {
                 try writer.writeAll("^I");
-            } else if (options.show_nonprinting and (c < 32 or c == 127) and c != '\n' and c != '\t') {
-                if (c < 32) {
+            } else if (options.show_nonprinting and (std.ascii.isControl(ch) or ch > 127) and ch != '\n' and ch != '\t') {
+                var lowch = ch;
+                if (ch > 127) {
+                    try writer.writeAll("M-");
+                    lowch = ch & 0x7F;
+                }
+                if (lowch < 32) {
                     try writer.writeByte('^');
-                    try writer.writeByte(c + 64);
-                } else if (c == 127) {
+                    try writer.writeByte(lowch + 64);
+                } else if (lowch == 127) {
                     try writer.writeAll("^?");
+                } else {
+                    try writer.writeByte(lowch);
+                    continue;
                 }
             } else {
-                if (detected_cp437 or options.cp437) {
-                    if (c == 0x1A) return;
+                if (detected_cp437 and !std.ascii.isControl(ch)) {
+                    if (ch == 0x1A) return;
                     var cbuf: [4]u8 = undefined;
-                    const clen = try std.unicode.utf8Encode(cp437_to_unicode[c], &cbuf);
+                    const clen = try std.unicode.utf8Encode(cp437_to_unicode[ch], &cbuf);
                     try writer.writeAll(cbuf[0..clen]);
                 } else {
-                    try writer.writeByte(c);
+                    try writer.writeByte(ch);
                 }
             }
+            prev = ch;
         }
-        if (options.show_ends) {
-            try writer.writeByte('$');
-        }
-        try writer.writeByte('\n');
-        try line_buf.resize(0);
     }
-
 }
 
 fn fastCat(file: *std.fs.File, writer: anytype) !void {
     var reader = file.reader();
     while (true) {
-        const len = try reader.read(&buf);
+        const len = try reader.read(&catbuf);
         if (len == 0) break;
-        try writer.writeAll(buf[0..len]);
+        try writer.writeAll(catbuf[0..len]);
     }
 }
 
