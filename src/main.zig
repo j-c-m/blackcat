@@ -361,62 +361,88 @@ pub fn main() !void {
             options.ansi_width = std.fmt.parseInt(usize, width_str, 10) catch 80;
             options.ansi = true;
             continue;
-        } else if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--ansi")) {
+        }
+        if (std.mem.eql(u8, arg, "--ansi")) {
             options.ansi = true;
             options.ansi_width = 80;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-A") or std.mem.eql(u8, arg, "--show-all")) {
+        if (std.mem.eql(u8, arg, "--show-all")) {
             options.show_ends = true;
             options.show_tabs = true;
             options.show_nonprinting = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--number-nonblank")) {
+        if (std.mem.eql(u8, arg, "--number-nonblank")) {
             options.number_nonblank = true;
             options.number = false;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--cp437")) {
+        if (std.mem.eql(u8, arg, "--cp437")) {
             options.cp437 = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-e")) {
-            options.show_ends = true;
-            options.show_nonprinting = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "-E") or std.mem.eql(u8, arg, "--show-ends")) {
+        if (std.mem.eql(u8, arg, "--show-ends")) {
             options.show_ends = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-k") or std.mem.eql(u8, arg, "--no-images")) {
+        if (std.mem.eql(u8, arg, "--no-images")) {
             options.kitty = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--number")) {
+        if (std.mem.eql(u8, arg, "--number")) {
             if (!options.number_nonblank) options.number = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--squeeze-blank")) {
+        if (std.mem.eql(u8, arg, "--squeeze-blank")) {
             options.squeeze_blank = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-t")) {
-            options.show_tabs = true;
-            options.show_nonprinting = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "-T") or std.mem.eql(u8, arg, "--show-tabs")) {
+        if (std.mem.eql(u8, arg, "--show-tabs")) {
             options.show_tabs = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-u")) {
-            // ignored
+        if (std.mem.eql(u8, arg, "--show-nonprinting")) {
+            options.show_nonprinting = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--show-nonprinting")) {
-            options.show_nonprinting = true;
+        // Combined short options
+        if (std.mem.startsWith(u8, arg, "-") and arg.len > 1 and arg[1] != '-') {
+            const shorts = arg[1..];
+            for (shorts) |opt| {
+                switch (opt) {
+                    'a' => {
+                        options.ansi = true;
+                        options.ansi_width = 80;
+                    },
+                    'A' => {
+                        options.show_ends = true;
+                        options.show_tabs = true;
+                        options.show_nonprinting = true;
+                    },
+                    'b' => {
+                        options.number_nonblank = true;
+                        options.number = false;
+                    },
+                    'c' => { options.cp437 = true; },
+                    'e' => {
+                        options.show_ends = true;
+                        options.show_nonprinting = true;
+                    },
+                    'E' => { options.show_ends = true; },
+                    'k' => { options.kitty = true; },
+                    'n' => { if (!options.number_nonblank) options.number = true; },
+                    's' => { options.squeeze_blank = true; },
+                    't' => {
+                        options.show_tabs = true;
+                        options.show_nonprinting = true;
+                    },
+                    'T' => { options.show_tabs = true; },
+                    'u' => {}, // ignored
+                    'v' => { options.show_nonprinting = true; },
+                    else => {},
+                }
+            }
             continue;
         }
         // treat as file
@@ -465,9 +491,11 @@ fn catFile(
     var detected_ansi: bool = options.ansi;
     var head_buf: [512]u8 = undefined;
 
-    const len = try reader.read(&head_buf);
-    if (len == 0) {
-        return;
+    if (!is_stdin) {
+        const len = try reader.read(&head_buf);
+        if (len == 0) {
+            return;
+        }
     }
 
     if (!is_stdin) {
