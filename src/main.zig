@@ -21,7 +21,6 @@ const Usage =
     \\  -s, --squeeze-blank       suppress repeated empty output lines
     \\  -t                        equivalent to -vT
     \\  -T, --show-tabs           display TAB characters as ^I
-    \\  -u                        (ignored)
     \\  -v, --show-nonprinting    use ^ and M- notation, except for LFD and TAB
     \\      --help                display this help and exit
     \\      --version             output version information and exit
