@@ -31,7 +31,7 @@ const Usage =
     \\
 ;
 
-const Version = "0.2.0";
+const Version = "0.2.1";
 
 const cp437_to_unicode = [_]u21{
     // 0-127
@@ -489,13 +489,14 @@ fn catFile(
 
     var detected_cp437: bool = options.cp437;
     var detected_ansi: bool = options.ansi;
-    var head_buf: [512]u8 = undefined;
+    var head_buf: [1024]u8 = undefined;
 
     if (!is_stdin) {
         const len = try reader.read(&head_buf);
         if (len == 0) {
             return;
         }
+        try file.seekTo(0);
     }
 
     if (!is_stdin) {
@@ -511,11 +512,10 @@ fn catFile(
         }
     }
 
-    if(!detected_ansi and !detected_ansi and !options.show_ends and
+    if(!detected_ansi and !detected_cp437 and !options.show_ends and
         !options.show_tabs and !options.show_nonprinting and
         !options.number and !options.number_nonblank and
         !options.squeeze_blank and !options.ansi and !options.cp437 and
-        !detected_cp437 and !detected_ansi and
         !is_stdin)
     {
         try fastCat(&file, writer);
