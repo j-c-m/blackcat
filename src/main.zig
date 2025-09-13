@@ -32,7 +32,7 @@ const Usage =
     \\
 ;
 
-const Version = "0.1.0";
+const Version = "0.2.0";
 
 const cp437_to_unicode = [_]u21{
     // 0-127
@@ -328,10 +328,10 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
+    var stdout = std.io.getStdOut().writer();
+
     var args = std.process.args();
     const prog_name = std.fs.path.basename(args.next() orelse "unknown");
-
-    const stdout = std.io.getStdOut().writer();
 
     var options: Options = .{
         .show_ends = false,
@@ -425,17 +425,16 @@ pub fn main() !void {
     }
 
     if (files.items.len == 0) {
-        try catFile("-", stdout, options);
+        try catFile("-", options);
     } else {
         for (files.items) |filename| {
-            try catFile(filename, stdout, options);
+            try catFile(filename, options);
         }
     }
 }
 
 fn catFile(
     filename: []const u8,
-    writer: anytype,
     options: Options,
 ) !void {
     const is_stdin = std.mem.eql(u8, filename, "-");
@@ -443,6 +442,7 @@ fn catFile(
     var file: std.fs.File = undefined;
     var file_opened = false;
     const stderr = std.io.getStdErr().writer();
+    const writer = std.io.getStdOut().writer();
 
     if (is_stdin) {
         reader = std.io.getStdIn().reader();
