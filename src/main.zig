@@ -31,7 +31,7 @@ const Usage =
     \\
 ;
 
-const Version = "0.2.5";
+const Version = "0.3.0";
 
 const cp437_to_unicode = [_]u21{
     // 0-127
@@ -323,6 +323,29 @@ fn sampleForCp437(head_buf: []const u8) !bool {
     return has_high_byte and has_crlf(head_buf[0..]);
 }
 
+fn isSauceCandidate(filename: []const u8) bool {
+    const ext = std.fs.path.extension(filename);
+    return std.ascii.eqlIgnoreCase(ext, ".ans") or std.ascii.eqlIgnoreCase(ext, ".asc");
+}
+
+fn parseSauceWidth(sauce_block: []const u8) usize {
+    if (sauce_block.len < 96) return 80;
+    const width = @as(usize, sauce_block[96]) + (@as(usize, sauce_block[97]) << 8);
+    return if (width > 0) width else 80;
+}
+
+fn checkSauce(file: *std.fs.File) !?usize {
+    const sauce_size: usize = 128;
+    var buf: [sauce_size]u8 = undefined;
+    const file_size = try file.getEndPos();
+    if (file_size < sauce_size) return null;
+    try file.seekTo(file_size - sauce_size);
+    const n = try file.readAll(&buf);
+    if (n != sauce_size) return null;
+    if (!std.mem.eql(u8, buf[0..5], "SAUCE")) return null;
+    return parseSauceWidth(&buf);
+}
+
 var catbuf: [131072]u8 = undefined;
 
 pub fn main() !void {
@@ -514,11 +537,6 @@ fn catFile(
         try file.seekTo(0);
     }
 
-    if (!is_stdin) {
-        if (!options.cp437) detected_cp437 = try sampleForCp437(&head_buf);
-        if (!options.ansi) detected_ansi = try sampleForAnsi(&head_buf);
-    }
-
     // Image detection (only for files, not stdin)
     if (!is_stdin and !options.kitty) {
         if (try isImageFile(&head_buf)) {
@@ -527,8 +545,23 @@ fn catFile(
         }
     }
 
+    if (!is_stdin) {
+        if (!options.cp437) detected_cp437 = try sampleForCp437(&head_buf);
+        if (!options.ansi) detected_ansi = try sampleForAnsi(&head_buf);
+    }
+
+    var sauce_width = options.ansi_width;
+    if (!is_stdin and isSauceCandidate(filename)) {
+        if (try checkSauce(&file)) |width| {
+            sauce_width = width;
+            detected_ansi = true;
+            //try writer.print("[SAUCE metadata detected: width={d}]\n", .{sauce_width});
+        }
+        try file.seekTo(0); // Reset for reading
+    }
+
     if (detected_ansi) {
-        try AnsiTerminal.renderReader(std.heap.page_allocator, reader, writer, options.ansi_width);
+        try AnsiTerminal.renderReader(std.heap.page_allocator, reader, writer, sauce_width);
         return;
     }
 
