@@ -31,7 +31,7 @@ const Usage =
     \\
 ;
 
-const Version = "0.2.4";
+const Version = "0.2.5";
 
 const cp437_to_unicode = [_]u21{
     // 0-127
@@ -601,8 +601,8 @@ fn catFile(
                     continue;
                 }
             } else {
+                if (detected_cp437 and ch == 0x1A) return;
                 if (detected_cp437 and !std.ascii.isControl(ch)) {
-                    if (ch == 0x1A) return;
                     var cbuf: [4]u8 = undefined;
                     const clen = try std.unicode.utf8Encode(cp437_to_unicode[ch], &cbuf);
                     try writer.writeAll(cbuf[0..clen]);
