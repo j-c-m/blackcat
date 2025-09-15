@@ -31,7 +31,7 @@ const Usage =
     \\
 ;
 
-const Version = "0.2.2";
+const Version = "0.2.3";
 
 const cp437_to_unicode = [_]u21{
     // 0-127
@@ -213,12 +213,14 @@ const AnsiTerminal = struct {
                         try writer.writeAll("\x1B[0m");
                     } else {
                         if (cell.fg != null) {
-                            const fg: u8 = if (cell.bold) cell.fg.? + 8 else cell.fg.?;
+                            const effective_fg = if (cell.fg.? < 8 and cell.bold) cell.fg.? + 8 else cell.fg.?;
+                            const fg: u8 = effective_fg;
                             const rgb = ColorMap[fg];
                             try writer.print("\x1B[38;2;{d};{d};{d}m", .{ rgb[0], rgb[1], rgb[2] });
                         }
                         if (cell.bg != null) {
-                            const bg: u8 = if (cell.blink) cell.bg.? + 8 else cell.bg.?;
+                            const effective_bg = if (cell.bg.? < 8 and cell.blink) cell.bg.? + 8 else cell.bg.?;
+                            const bg: u8 = effective_bg;
                             const rgb = ColorMap[bg];
                             try writer.print("\x1B[48;2;{d};{d};{d}m", .{ rgb[0], rgb[1], rgb[2] });
                         }
@@ -324,9 +326,6 @@ fn sampleForCp437(head_buf: []const u8) !bool {
 var catbuf: [131072]u8 = undefined;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-
     var stdout = std.io.getStdOut().writer();
 
     var args = std.process.args();
@@ -345,7 +344,7 @@ pub fn main() !void {
         .kitty = false,
     };
 
-    var files = std.ArrayList([]const u8).init(allocator);
+    var has_files = false;
 
     var processing_options = true;
     while (args.next()) |arg| {
@@ -392,7 +391,7 @@ pub fn main() !void {
                 options.show_ends = true;
                 continue;
             }
-            if (std.mem.eql(u8, arg, "--no-images")) {
+            if (std.mem.eql(u8, arg, "--no-image")) {
                 options.kitty = true;
                 continue;
             }
@@ -469,15 +468,12 @@ pub fn main() !void {
             processing_options = false;
         }
         // treat as file
-        try files.append(arg);
+        try catFile(arg, options);
+        has_files = true;
     }
 
-    if (files.items.len == 0) {
+    if(!has_files) {
         try catFile("-", options);
-    } else {
-        for (files.items) |filename| {
-            try catFile(filename, options);
-        }
     }
 }
 
@@ -587,10 +583,6 @@ fn catFile(
                 }
             }
 
-            if (options.show_ends and prev == '\r' and ch != '\n') {
-                try writer.writeByte('\r');
-            }
-
             if (ch == '\t' and options.show_tabs) {
                 try writer.writeAll("^I");
             } else if (options.show_nonprinting and (std.ascii.isControl(ch) or ch > 127) and ch != '\n' and ch != '\t') {
@@ -648,8 +640,6 @@ fn renderImage(file: *std.fs.File, writer: anytype) !void {
     const allocator = std.heap.page_allocator;
     var img = try zigimg.Image.fromFile(allocator, file);
     defer img.deinit();
-
-    _ = file.seekTo(0) catch {};
 
     const original_width = img.width;
     const original_height = img.height;
