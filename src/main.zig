@@ -31,7 +31,7 @@ const Usage =
     \\
 ;
 
-const Version = "0.3.1";
+const Version = "0.3.2";
 
 const cp437_to_unicode = [_]u21{
     // 0-127
