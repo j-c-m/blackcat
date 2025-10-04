@@ -3,16 +3,16 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     // Release packaging options
     const release = b.option(bool, "package_release", "Build all release targets") orelse false;
-    const strip = b.option(bool, "strip", "Disable debug information (default: no)");
+    //const strip = b.option(bool, "strip", "Disable debug information (default: no)");
     const pie = b.option(bool, "pie", "Produce an executable with position independent code (default: none)");
 
     const run_step = b.step("run", "Run the app");
     const test_step = b.step("test", "Run unit tests");
 
     if (release) {
-        build_release(b, run_step, test_step, strip, pie);
+        build_release(b, run_step, test_step, pie);
     } else {
-        build_development(b, run_step, test_step, strip, pie);
+        build_development(b, run_step, test_step, pie);
     }
 }
 
@@ -20,7 +20,7 @@ fn build_development(
     b: *std.Build,
     run_step: *std.Build.Step,
     test_step: *std.Build.Step,
-    strip: ?bool,
+    //strip: ?bool,
     pie: ?bool,
 ) void {
     const target = b.standardTargetOptions(.{});
@@ -33,7 +33,7 @@ fn build_development(
         target,
         optimize,
         .{},
-        strip orelse false,
+        //strip orelse false,
         pie,
     );
 }
@@ -42,7 +42,7 @@ fn build_release(
     b: *std.Build,
     run_step: *std.Build.Step,
     test_step: *std.Build.Step,
-    strip: ?bool,
+    //strip: ?bool,
     pie: ?bool,
 ) void {
     const targets: []const std.Target.Query = &.{
@@ -53,9 +53,9 @@ fn build_release(
     };
     const optimize = .ReleaseSmall;
 
-    var version = std.ArrayList(u8).init(b.allocator);
-    defer version.deinit();
-    gen_version(b, version.writer()) catch unreachable;
+    var version = std.ArrayList(u8).initCapacity(b.allocator, 0) catch unreachable;
+    defer version.deinit(b.allocator);
+    gen_version(b, version.writer(b.allocator)) catch unreachable;
     const write_file_step = b.addWriteFiles();
     const version_file = write_file_step.add("version", version.items);
     b.getInstallStep().dependOn(&b.addInstallFile(version_file, "version").step);
@@ -74,7 +74,7 @@ fn build_release(
             target,
             optimize,
             .{ .dest_dir = .{ .override = .{ .custom = target_path } } },
-            strip orelse true,
+            //strip orelse true,
             pie,
         );
     }
@@ -87,7 +87,7 @@ fn build_exe(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     exe_install_options: std.Build.Step.InstallArtifact.Options,
-    strip: bool,
+    //strip: bool,
     pie: ?bool,
 ) void {
     const exe_mod = b.createModule(.{
@@ -100,7 +100,7 @@ fn build_exe(
     const exe = b.addExecutable(.{
         .name = "blackcat",
         .root_module = exe_mod,
-        .strip = strip,
+        //.strip = strip,
     });
     if (pie) |value| exe.pie = value;
 

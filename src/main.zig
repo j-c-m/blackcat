@@ -107,8 +107,8 @@ const AnsiTerminal = struct {
     bold: bool,
     blink: bool,
 
-    pub fn init(allocator: std.mem.Allocator, width: usize) AnsiTerminal {
-        const screen = std.ArrayList(std.ArrayList(ScreenCell)).init(allocator);
+    pub fn init(allocator: std.mem.Allocator, width: usize) !AnsiTerminal {
+        const screen = try std.ArrayList(std.ArrayList(ScreenCell)).initCapacity(allocator, 0);
         return AnsiTerminal{
             .allocator = allocator,
             .screen = screen,
@@ -123,17 +123,17 @@ const AnsiTerminal = struct {
     }
 
     pub fn deinit(self: *AnsiTerminal) void {
-        for (self.screen.items) |*row| row.deinit();
-        self.screen.deinit();
+        for (self.screen.items) |*row| row.deinit(self.allocator);
+        self.screen.deinit(self.allocator);
     }
 
-    pub fn putChar(self: *AnsiTerminal, ch: u21) void {
+    pub fn putChar(self: *AnsiTerminal, ch: u21) !void {
         while (self.cursor_y >= self.screen.items.len) {
-            var row = std.ArrayList(ScreenCell).init(self.allocator);
+            var row = try std.ArrayList(ScreenCell).initCapacity(self.allocator, self.width);
             for (0..self.width) |_| {
-                row.append(ScreenCell{ .ch = ' ', .fg = null, .bg = 0, .bold = false, .blink = false }) catch {};
+                row.append(self.allocator, ScreenCell{ .ch = ' ', .fg = null, .bg = 0, .bold = false, .blink = false }) catch {};
             }
-            self.screen.append(row) catch return;
+            self.screen.append(self.allocator, row) catch return;
         }
         if (self.cursor_x >= self.width) return;
         self.screen.items[self.cursor_y].items[self.cursor_x] = ScreenCell{
@@ -150,7 +150,7 @@ const AnsiTerminal = struct {
         }
     }
 
-    pub fn processEscape(self: *AnsiTerminal, seq: []const u8) void {
+    pub fn processEscape(self: *AnsiTerminal, seq: []const u8) !void {
         if (seq.len < 3 or seq[0] != 0x1B or seq[1] != '[') return;
         const command = seq[seq.len - 1];
         const params_str = seq[2 .. seq.len - 1];
@@ -174,12 +174,12 @@ const AnsiTerminal = struct {
             self.cursor_y = if (row > 0) row - 1 else 0;
             self.cursor_x = if (col > 0) col - 1 else 0;
         } else if (command == 'm') { // SGR (color/style)
-            var codes = std.ArrayList(u8).init(self.allocator);
-            defer codes.deinit();
+            var codes = try std.ArrayList(u8).initCapacity(self.allocator, 0);
+            defer codes.deinit(self.allocator);
             while (params.next()) |p| {
-                if (p.len > 0) codes.append(std.fmt.parseInt(u8, p, 10) catch 0) catch {};
+                if (p.len > 0) codes.append(self.allocator, std.fmt.parseInt(u8, p, 10) catch 0) catch {};
             }
-            if (codes.items.len == 0) codes.append(0) catch {};
+            if (codes.items.len == 0) codes.append(self.allocator, 0) catch {};
             for (codes.items) |code| {
                 switch (code) {
                     0 => {
@@ -201,7 +201,7 @@ const AnsiTerminal = struct {
         // Ignore other commands for now
     }
 
-    pub fn render(self: *AnsiTerminal, writer: anytype) !void {
+    pub fn render(self: *AnsiTerminal, writer: *std.io.Writer) !void {
         for (self.screen.items) |row| {
             var current_fg: ?u8 = null;
             var current_bg: ?u8 = null;
@@ -235,18 +235,23 @@ const AnsiTerminal = struct {
                 try writer.writeAll(cbuf[0..len]);
             }
             try writer.writeAll("\x1B[0m\n");
+            try writer.flush();
         }
     }
 
-    pub fn renderReader(allocator: std.mem.Allocator, reader: anytype, writer: anytype, width: usize) !void {
-        var content = std.ArrayList(u8).init(allocator);
-        defer content.deinit();
-        while (true) {
-            const len = try reader.read(&catbuf);
+    pub fn renderReader(allocator: std.mem.Allocator, reader: *std.fs.File.Reader, writer: *std.io.Writer, width: usize) !void {
+        var content = try std.ArrayList(u8).initCapacity(allocator, 1024);
+        defer content.deinit(allocator);
+        while (reader.read(&catbuf)) |len| {
             if (len == 0) break;
-            try content.appendSlice(catbuf[0..len]);
+            try content.appendSlice(allocator, catbuf[0..len]);
+        } else |err| {
+            if (err != error.EndOfStream) {
+                std.debug.print("Error reading file: {}", .{err});
+                return err;
+            }
         }
-        var term = AnsiTerminal.init(allocator, width);
+        var term = try AnsiTerminal.init(allocator, width);
         defer term.deinit();
         var i: usize = 0;
         const data = content.items;
@@ -256,7 +261,7 @@ const AnsiTerminal = struct {
                 while (j < data.len and !(data[j] >= 0x40 and data[j] <= 0x7E)) j += 1;
                 if (j < data.len) {
                     const seq = data[i .. j + 1];
-                    term.processEscape(seq);
+                    try term.processEscape(seq);
                     i = j + 1;
                     continue;
                 }
@@ -276,7 +281,7 @@ const AnsiTerminal = struct {
                 break;
             }
             const cp = cp437_to_unicode[data[i]];
-            term.putChar(cp);
+            try term.putChar(cp);
             i += 1;
         }
         try term.render(writer);
@@ -347,10 +352,11 @@ fn checkSauce(file: *std.fs.File) !?usize {
 }
 
 var catbuf: [131072]u8 = undefined;
+var stdoutbuf: [1024]u8 = undefined;
+var stdoutwriter = std.fs.File.stdout().writer(&stdoutbuf);
+const stdout = &stdoutwriter.interface;
 
 pub fn main() !void {
-    var stdout = std.io.getStdOut().writer();
-
     var args = std.process.args();
     const prog_name = std.fs.path.basename(args.next() orelse "unknown");
 
@@ -506,20 +512,20 @@ fn catFile(
 ) !void {
     const is_stdin = std.mem.eql(u8, filename, "-");
     var reader: std.fs.File.Reader = undefined;
+    var read_buf: [1024]u8 = undefined;
     var file: std.fs.File = undefined;
     var file_opened = false;
-    const stderr = std.io.getStdErr().writer();
-    const writer = std.io.getStdOut().writer();
 
     if (is_stdin) {
-        reader = std.io.getStdIn().reader();
+        const stdinreader = std.fs.File.stdin().reader(&read_buf);
+        reader = stdinreader;
     } else {
         file = std.fs.cwd().openFile(filename, .{ .mode = .read_only }) catch {
-            try stderr.print("blackcat: {s}: No such file or directory\n", .{filename});
+            std.debug.print("blackcat: {s}: No such file or directory\n", .{filename});
             return;
         };
         file_opened = true;
-        reader = file.reader();
+        reader = file.reader(&read_buf);
     }
     defer if (file_opened) file.close();
 
@@ -534,13 +540,13 @@ fn catFile(
         if (len == 0) {
             return;
         }
-        try file.seekTo(0);
+        try reader.seekTo(0);
     }
 
     // Image detection (only for files, not stdin)
     if (!is_stdin and !options.kitty) {
         if (try isImageFile(&head_buf)) {
-            try renderImage(&file, writer);
+            try renderImage(&file, stdout);
             return;
         }
     }
@@ -557,11 +563,11 @@ fn catFile(
             detected_ansi = true;
             //try writer.print("[SAUCE metadata detected: width={d}]\n", .{sauce_width});
         }
-        try file.seekTo(0); // Reset for reading
+        try file.seekTo(0);
     }
 
     if (detected_ansi) {
-        try AnsiTerminal.renderReader(std.heap.page_allocator, reader, writer, sauce_width);
+        try AnsiTerminal.renderReader(std.heap.page_allocator, &reader, stdout, sauce_width);
         return;
     }
 
@@ -570,7 +576,7 @@ fn catFile(
         !options.number and !options.number_nonblank and
         !options.squeeze_blank and !is_stdin)
     {
-        try fastCat(&file, writer);
+        try fastCat(&file, stdout);
         return;
     }
 
@@ -592,10 +598,10 @@ fn catFile(
                 }
 
                 if (options.number and !options.number_nonblank) {
-                    try writer.print("{d:>6}  ", .{line_num});
+                    try stdout.print("{d:>6}  ", .{line_num});
                     line_num += 1;
                 } else if (options.number_nonblank and ch != '\n') {
-                    try writer.print("{d:>6}  ", .{line_num});
+                    try stdout.print("{d:>6}  ", .{line_num});
                     line_num += 1;
                 }
             }
@@ -607,30 +613,30 @@ fn catFile(
                 }
                 if (ch == '\n') {
                     if (prev == '\r') {
-                        try writer.writeAll("^M");
+                        try stdout.writeAll("^M");
                     }
-                    try writer.writeAll("$");
+                    try stdout.writeAll("$");
                 }
                 if (prev == '\r' and ch != '\n') {
-                    try writer.writeByte('\r');
+                    try stdout.writeByte('\r');
                 }
             }
 
             if (ch == '\t' and options.show_tabs) {
-                try writer.writeAll("^I");
+                try stdout.writeAll("^I");
             } else if (options.show_nonprinting and (std.ascii.isControl(ch) or ch > 127) and ch != '\n' and ch != '\t') {
                 var lowch = ch;
                 if (ch > 127) {
-                    try writer.writeAll("M-");
+                    try stdout.writeAll("M-");
                     lowch = ch & 0x7F;
                 }
                 if (lowch < 32) {
-                    try writer.writeByte('^');
-                    try writer.writeByte(lowch + 64);
+                    try stdout.writeByte('^');
+                    try stdout.writeByte(lowch + 64);
                 } else if (lowch == 127) {
-                    try writer.writeAll("^?");
+                    try stdout.writeAll("^?");
                 } else {
-                    try writer.writeByte(lowch);
+                    try stdout.writeByte(lowch);
                     continue;
                 }
             } else {
@@ -638,9 +644,9 @@ fn catFile(
                 if (detected_cp437 and !std.ascii.isControl(ch)) {
                     var cbuf: [4]u8 = undefined;
                     const clen = try std.unicode.utf8Encode(cp437_to_unicode[ch], &cbuf);
-                    try writer.writeAll(cbuf[0..clen]);
+                    try stdout.writeAll(cbuf[0..clen]);
                 } else {
-                    try writer.writeByte(ch);
+                    try stdout.writeByte(ch);
                 }
             }
             prev = ch;
@@ -648,12 +654,17 @@ fn catFile(
     }
 }
 
-fn fastCat(file: *std.fs.File, writer: anytype) !void {
-    var reader = file.reader();
-    while (true) {
-        const len = try reader.read(&catbuf);
+fn fastCat(file: *std.fs.File, writer: *std.io.Writer) !void {
+    var read_buf: [8192]u8 = undefined;
+    var reader = file.reader(&read_buf);
+    while (reader.read(&catbuf)) |len| {
         if (len == 0) break;
         try writer.writeAll(catbuf[0..len]);
+    } else |err| {
+        if (err != error.EndOfStream) {
+            std.debug.print("Error reading file: {}", .{err});
+            return err;
+        }
     }
 }
 
@@ -669,10 +680,11 @@ const Winsize = extern struct {
     ws_ypixel: u16,
 };
 
-fn renderImage(file: *std.fs.File, writer: anytype) !void {
+fn renderImage(file: *std.fs.File, writer: *std.io.Writer) !void {
     const allocator = std.heap.page_allocator;
-    var img = try zigimg.Image.fromFile(allocator, file);
-    defer img.deinit();
+    var read_buf: [zigimg.io.DEFAULT_BUFFER_SIZE]u8 = undefined;
+    var img = try zigimg.Image.fromFile(allocator, file.*, &read_buf);
+    defer img.deinit(allocator);
 
     const original_width = img.width;
     const original_height = img.height;
@@ -705,7 +717,7 @@ fn renderImage(file: *std.fs.File, writer: anytype) !void {
     const new_h: u32 = @intFromFloat(scale * img_h);
 
     // Convert to RGBA (kitty f=32)
-    try img.convert(.rgba32);
+    try img.convert(allocator, .rgba32);
 
     // Resize if needed
     if (new_w < original_width or new_h < original_height) {
@@ -713,20 +725,20 @@ fn renderImage(file: *std.fs.File, writer: anytype) !void {
     }
 
     // Prepare byte array for RGBA data
-    var byte_data = std.ArrayList(u8).init(allocator);
-    defer byte_data.deinit();
+    var byte_data = try std.ArrayList(u8).initCapacity(allocator, img.pixels.rgba32.len * 4);
+    defer byte_data.deinit(allocator);
     for (img.pixels.rgba32) |px| {
-        try byte_data.append(px.r);
-        try byte_data.append(px.g);
-        try byte_data.append(px.b);
-        try byte_data.append(px.a);
+        try byte_data.append(allocator, px.r);
+        try byte_data.append(allocator, px.g);
+        try byte_data.append(allocator, px.b);
+        try byte_data.append(allocator, px.a);
     }
 
     // Encode RGBA byte data to base64 for kitty
-    var encoded = std.ArrayList(u8).init(allocator);
-    defer encoded.deinit();
+    var encoded = try std.ArrayList(u8).initCapacity(allocator, byte_data.items.len * 4 / 3);
+    defer encoded.deinit(allocator);
     const out_len = std.base64.standard.Encoder.calcSize(byte_data.items.len);
-    try encoded.resize(out_len);
+    try encoded.resize(allocator, out_len);
     _ = std.base64.standard.Encoder.encode(encoded.items, byte_data.items);
 
     try writer.print("\n     ", .{});
@@ -755,12 +767,13 @@ fn renderImage(file: *std.fs.File, writer: anytype) !void {
         }
     }
     try writer.print("\n\n", .{});
+    try writer.flush();
 }
 
 // Bilinear image resizing
 fn resizeImage(alloc: std.mem.Allocator, img: *zigimg.Image, new_w: u32, new_h: u32) !void {
     if (img.pixelFormat() != .rgba32) {
-        try img.convert(.rgba32);
+        try img.convert(alloc, .rgba32);
     }
 
     const original_width = img.width;
