@@ -583,9 +583,8 @@ fn catFile(
     var prev: u8 = '\n';
     var squeeze: bool = false;
 
-    while (true) {
-        const len = try reader.read(&catbuf);
-        if (len == 0) break;
+    while (reader.read(&catbuf)) |len| {
+        if (len == 0) return;
         for (catbuf[0..len]) |ch| {
             if (prev == '\n') {
                 if (options.squeeze_blank) {
@@ -651,7 +650,13 @@ fn catFile(
             }
             prev = ch;
         }
+    } else |err| {
+        if (err != error.EndOfStream) {
+            std.debug.print("Error reading file: {}", .{err});
+            return err;
+        }
     }
+    try stdout.flush();
 }
 
 fn fastCat(file: *std.fs.File, writer: *std.io.Writer) !void {
