@@ -511,14 +511,13 @@ fn catFile(
     options: Options,
 ) !void {
     const is_stdin = std.mem.eql(u8, filename, "-");
-    var reader: std.fs.File.Reader = undefined;
+    var reader: ?std.fs.File.Reader = null;
     var read_buf: [1024]u8 = undefined;
     var file: std.fs.File = undefined;
     var file_opened = false;
 
     if (is_stdin) {
-        const stdinreader = std.fs.File.stdin().reader(&read_buf);
-        reader = stdinreader;
+        file = std.fs.File.stdin();
     } else {
         file = std.fs.cwd().openFile(filename, .{ .mode = .read_only }) catch {
             std.debug.print("blackcat: {s}: No such file or directory\n", .{filename});
@@ -536,11 +535,11 @@ fn catFile(
     var head_buf: [1024]u8 = undefined;
 
     if (!is_stdin) {
-        const len = try reader.read(&head_buf);
+        const len = try reader.?.read(&head_buf);
         if (len == 0) {
             return;
         }
-        try reader.seekTo(0);
+        try reader.?.seekTo(0);
     }
 
     // Image detection (only for files, not stdin)
@@ -567,7 +566,9 @@ fn catFile(
     }
 
     if (detected_ansi) {
-        try AnsiTerminal.renderReader(std.heap.page_allocator, &reader, stdout, sauce_width);
+        if (reader) |*r| {
+            try AnsiTerminal.renderReader(std.heap.page_allocator, r, stdout, sauce_width);
+        }
         return;
     }
 
@@ -583,7 +584,7 @@ fn catFile(
     var prev: u8 = '\n';
     var squeeze: bool = false;
 
-    while (reader.read(&catbuf)) |len| {
+    while (if (is_stdin) file.read(&catbuf) else reader.?.read(&catbuf)) |len| {
         if (len == 0) return;
         for (catbuf[0..len]) |ch| {
             if (prev == '\n') {
