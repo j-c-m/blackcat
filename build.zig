@@ -1,4 +1,5 @@
 const std = @import("std");
+const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     // Release packaging options
@@ -103,6 +104,11 @@ fn build_exe(
         //.strip = strip,
     });
     if (pie) |value| exe.pie = value;
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", zon.version);
+    build_options.addOption([]const u8, "name", @tagName(zon.name));
+    exe.root_module.addOptions("build_options", build_options);
 
     const zigimg_dependency = b.dependency("zigimg", .{
         .target = target,

@@ -1,6 +1,7 @@
 const std = @import("std");
 const zigimg = @import("zigimg");
 const base64 = std.base64;
+const build_options = @import("build_options");
 
 const Usage =
     \\USAGE: {s} [OPTION]... [FILE]...
@@ -31,7 +32,8 @@ const Usage =
     \\
 ;
 
-const Version = "0.3.2";
+const version = build_options.version;
+const prog_name = build_options.name;
 
 const cp437_to_unicode = [_]u21{
     // 0-127
@@ -239,10 +241,10 @@ const AnsiTerminal = struct {
         }
     }
 
-    pub fn renderReader(allocator: std.mem.Allocator, reader: *std.fs.File.Reader, writer: *std.io.Writer, width: usize) !void {
+    pub fn renderFile(allocator: std.mem.Allocator, file: *std.fs.File, writer: *std.io.Writer, width: usize) !void {
         var content = try std.ArrayList(u8).initCapacity(allocator, 1024);
         defer content.deinit(allocator);
-        while (reader.read(&catbuf)) |len| {
+        while (file.read(&catbuf)) |len| {
             if (len == 0) break;
             try content.appendSlice(allocator, catbuf[0..len]);
         } else |err| {
@@ -358,7 +360,6 @@ const stdout = &stdoutwriter.interface;
 
 pub fn main() !void {
     var args = std.process.args();
-    const prog_name = std.fs.path.basename(args.next() orelse "unknown");
 
     var options: Options = .{
         .show_ends = false,
@@ -376,6 +377,7 @@ pub fn main() !void {
     var has_files = false;
 
     var processing_options = true;
+    _ = args.next();
     while (args.next()) |arg| {
         if (processing_options) {
             if (std.mem.eql(u8, arg, "--")) {
@@ -384,10 +386,12 @@ pub fn main() !void {
             }
             if (std.mem.eql(u8, arg, "--help")) {
                 try stdout.print(Usage, .{prog_name});
+                try stdout.flush();
                 return;
             }
             if (std.mem.eql(u8, arg, "--version")) {
-                try stdout.print("blackcat {s}\n", .{Version});
+                try stdout.print("blackcat {s}\n", .{version});
+                try stdout.flush();
                 return;
             }
             if (std.mem.startsWith(u8, arg, "--ansi=")) {
@@ -511,21 +515,17 @@ fn catFile(
     options: Options,
 ) !void {
     const is_stdin = std.mem.eql(u8, filename, "-");
-    var reader: std.fs.File.Reader = undefined;
-    var read_buf: [1024]u8 = undefined;
     var file: std.fs.File = undefined;
     var file_opened = false;
 
     if (is_stdin) {
-        const stdinreader = std.fs.File.stdin().reader(&read_buf);
-        reader = stdinreader;
+        file = std.fs.File.stdin();
     } else {
         file = std.fs.cwd().openFile(filename, .{ .mode = .read_only }) catch {
             std.debug.print("blackcat: {s}: No such file or directory\n", .{filename});
             return;
         };
         file_opened = true;
-        reader = file.reader(&read_buf);
     }
     defer if (file_opened) file.close();
 
@@ -536,11 +536,14 @@ fn catFile(
     var head_buf: [1024]u8 = undefined;
 
     if (!is_stdin) {
-        const len = try reader.read(&head_buf);
+        const len = file.read(&head_buf) catch |err| {
+            std.debug.print("blackcat: {s}: {}\n", .{filename, err});
+            return;
+        };
         if (len == 0) {
             return;
         }
-        try reader.seekTo(0);
+        try file.seekTo(0);
     }
 
     // Image detection (only for files, not stdin)
@@ -567,7 +570,7 @@ fn catFile(
     }
 
     if (detected_ansi) {
-        try AnsiTerminal.renderReader(std.heap.page_allocator, &reader, stdout, sauce_width);
+        try AnsiTerminal.renderFile(std.heap.page_allocator, &file, stdout, sauce_width);
         return;
     }
 
@@ -576,14 +579,16 @@ fn catFile(
         !options.number and !options.number_nonblank and
         !options.squeeze_blank and !is_stdin)
     {
-        try fastCat(&file, stdout);
-        return;
+        fastCat(&file, stdout) catch |err| {
+            std.debug.print("blackcat: {s}: {}\n", .{filename, err});
+            return;
+        };
     }
 
     var prev: u8 = '\n';
     var squeeze: bool = false;
 
-    while (reader.read(&catbuf)) |len| {
+    while (file.read(&catbuf)) |len| {
         if (len == 0) return;
         for (catbuf[0..len]) |ch| {
             if (prev == '\n') {
@@ -649,27 +654,22 @@ fn catFile(
                 }
             }
             prev = ch;
+            try stdout.flush();
         }
     } else |err| {
-        if (err != error.EndOfStream) {
-            std.debug.print("Error reading file: {}", .{err});
-            return err;
-        }
+        std.debug.print("blackcat: {s}: {}\n", .{filename, err});
+        return err;
     }
     try stdout.flush();
 }
 
 fn fastCat(file: *std.fs.File, writer: *std.io.Writer) !void {
-    var read_buf: [8192]u8 = undefined;
-    var reader = file.reader(&read_buf);
-    while (reader.read(&catbuf)) |len| {
+    while (file.read(&catbuf)) |len| {
         if (len == 0) break;
         try writer.writeAll(catbuf[0..len]);
+        try writer.flush();
     } else |err| {
-        if (err != error.EndOfStream) {
-            std.debug.print("Error reading file: {}", .{err});
-            return err;
-        }
+        return err;
     }
 }
 
