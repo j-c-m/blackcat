@@ -12,8 +12,8 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     env:
-      ZIG_VERSION: 0.14.1
-      ZIG_URL: https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz
+      ZIG_VERSION: 0.15.1
+      ZIG_URL: https://ziglang.org/download/0.15.1/zig-x86_64-linux-0.15.1.tar.xz
 
     steps:
       - name: Checkout code
