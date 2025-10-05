@@ -685,8 +685,7 @@ const Winsize = extern struct {
 
 fn renderImage(file: *std.fs.File, writer: *std.io.Writer) !void {
     const allocator = std.heap.page_allocator;
-    var read_buf: [zigimg.io.DEFAULT_BUFFER_SIZE]u8 = undefined;
-    var img = try zigimg.Image.fromFile(allocator, file.*, &read_buf);
+    var img = try zigimg.Image.fromFile(allocator, file.*, &catbuf);
     defer img.deinit(allocator);
 
     const original_width = img.width;
