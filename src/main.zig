@@ -654,11 +654,11 @@ fn catFile(
             }
             prev = ch;
         }
+        try stdout.flush();
     } else |err| {
         std.debug.print("blackcat: {s}: {}\n", .{ filename, err });
         return err;
     }
-    try stdout.flush();
 }
 
 fn fastCat(file: *std.fs.File, writer: *std.io.Writer) !void {
