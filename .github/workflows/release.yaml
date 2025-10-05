@@ -44,9 +44,15 @@ jobs:
       - name: Package binaries
         run: |
           cd zig-out
+          VERSION="${{ steps.set_tag.outputs.tag }}"
+          VERSION="${VERSION#v}"
           for dir in *; do
             if [ -d "$dir" ]; then
-              tar -czvf "$dir.tgz" -C "$dir" .
+              PKGDIR="blackcat-${dir}-${VERSION}"
+              mkdir "$PKGDIR"
+              cp -r "$dir"/* "$PKGDIR"/
+              tar -czvf "${PKGDIR}.tgz" "$PKGDIR"
+              rm -rf "$PKGDIR"
             fi
           done
 
