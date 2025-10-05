@@ -353,13 +353,14 @@ fn checkSauce(file: *std.fs.File) !?usize {
     return parseSauceWidth(&buf);
 }
 
-var catbuf: [131072]u8 = undefined;
-var stdoutbuf: [1024]u8 = undefined;
+var catbuf: [65536]u8 = undefined;
+var stdoutbuf: [65536]u8 = undefined;
 var stdoutwriter = std.fs.File.stdout().writer(&stdoutbuf);
 const stdout = &stdoutwriter.interface;
 
 pub fn main() !void {
     var args = std.process.args();
+    defer stdout.flush() catch {};
 
     var options: Options = .{
         .show_ends = false,
@@ -386,12 +387,10 @@ pub fn main() !void {
             }
             if (std.mem.eql(u8, arg, "--help")) {
                 try stdout.print(Usage, .{prog_name});
-                try stdout.flush();
                 return;
             }
             if (std.mem.eql(u8, arg, "--version")) {
                 try stdout.print("blackcat {s}\n", .{version});
-                try stdout.flush();
                 return;
             }
             if (std.mem.startsWith(u8, arg, "--ansi=")) {
@@ -537,7 +536,7 @@ fn catFile(
 
     if (!is_stdin) {
         const len = file.read(&head_buf) catch |err| {
-            std.debug.print("blackcat: {s}: {}\n", .{filename, err});
+            std.debug.print("blackcat: {s}: {}\n", .{ filename, err });
             return;
         };
         if (len == 0) {
@@ -580,7 +579,7 @@ fn catFile(
         !options.squeeze_blank and !is_stdin)
     {
         fastCat(&file, stdout) catch |err| {
-            std.debug.print("blackcat: {s}: {}\n", .{filename, err});
+            std.debug.print("blackcat: {s}: {}\n", .{ filename, err });
             return;
         };
     }
@@ -654,10 +653,9 @@ fn catFile(
                 }
             }
             prev = ch;
-            try stdout.flush();
         }
     } else |err| {
-        std.debug.print("blackcat: {s}: {}\n", .{filename, err});
+        std.debug.print("blackcat: {s}: {}\n", .{ filename, err });
         return err;
     }
     try stdout.flush();
