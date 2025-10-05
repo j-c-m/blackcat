@@ -580,8 +580,8 @@ fn catFile(
     {
         fastCat(&file, stdout) catch |err| {
             std.debug.print("blackcat: {s}: {}\n", .{ filename, err });
-            return;
         };
+        return;
     }
 
     var prev: u8 = '\n';
