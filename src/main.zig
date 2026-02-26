@@ -390,7 +390,7 @@ pub fn main() !void {
                 return;
             }
             if (std.mem.eql(u8, arg, "--version")) {
-                try stdout.print("blackcat {s}\n", .{version});
+                try stdout.print("{s} {s}\n", .{prog_name, version});
                 return;
             }
             if (std.mem.startsWith(u8, arg, "--ansi=")) {
@@ -521,7 +521,7 @@ fn catFile(
         file = std.fs.File.stdin();
     } else {
         file = std.fs.cwd().openFile(filename, .{ .mode = .read_only }) catch {
-            std.debug.print("blackcat: {s}: No such file or directory\n", .{filename});
+            std.debug.print("{s}: {s}: No such file or directory\n", .{prog_name, filename});
             return;
         };
         file_opened = true;
@@ -536,7 +536,7 @@ fn catFile(
 
     if (!is_stdin) {
         const len = file.read(&head_buf) catch |err| {
-            std.debug.print("blackcat: {s}: {}\n", .{ filename, err });
+            std.debug.print("{s}: {s}: {}\n", .{prog_name, filename, err});
             return;
         };
         if (len == 0) {
@@ -579,7 +579,7 @@ fn catFile(
         !options.squeeze_blank and !is_stdin)
     {
         fastCat(&file, stdout) catch |err| {
-            std.debug.print("blackcat: {s}: {}\n", .{ filename, err });
+            std.debug.print("{s}: {s}: {}\n", .{prog_name, filename, err});
         };
         return;
     }
@@ -656,7 +656,7 @@ fn catFile(
         }
         try stdout.flush();
     } else |err| {
-        std.debug.print("blackcat: {s}: {}\n", .{ filename, err });
+        std.debug.print("{s}: {s}: {}\n", .{prog_name, filename, err});
         return err;
     }
 }
