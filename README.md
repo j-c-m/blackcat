@@ -33,6 +33,6 @@ Options:
       --version             output version information and exit
 
 EXAMPLES
-  cat f - g      Output f's contents, then stdin, then g's contents.
-  cat            Copy stdin to stdout.
+  blackcat f - g      Output f's contents, then stdin, then g's contents.
+  blackcat            Copy stdin to stdout.
 ```
