@@ -68,7 +68,7 @@ const Options = struct {
     cp437: bool,
     ansi: bool,
     ansi_width: usize,
-    kitty: bool,
+    no_kitty: bool,
     kitty_only: bool,
 };
 
@@ -374,7 +374,7 @@ pub fn main() !void {
         .cp437 = false,
         .ansi = false,
         .ansi_width = 80,
-        .kitty = false,
+        .no_kitty = false,
         .kitty_only = false,
     };
 
@@ -427,7 +427,7 @@ pub fn main() !void {
                 continue;
             }
             if (std.mem.eql(u8, arg, "--no-image")) {
-                options.kitty = true;
+                options.no_kitty = true;
                 continue;
             }
             if (std.mem.eql(u8, arg, "--image-only")) {
@@ -479,7 +479,7 @@ pub fn main() !void {
                             options.show_ends = true;
                         },
                         'k' => {
-                            options.kitty = true;
+                            options.no_kitty = true;
                         },
                         'K' => {
                             options.kitty_only = true;
@@ -509,7 +509,7 @@ pub fn main() !void {
             // If we reach here, it's not an option, so stop processing options and treat as file
             processing_options = false;
 
-            if (options.kitty and options.kitty_only) {
+            if (options.no_kitty and options.kitty_only) {
                 std.debug.print("{s}: Incompatible arguments\n", .{prog_name});
                 return;
             }
@@ -562,7 +562,7 @@ fn catFile(
     }
 
     // Image detection (only for files, not stdin)
-    if (options.kitty_only or (!is_stdin and !options.kitty)) {
+    if (options.kitty_only or (!is_stdin and !options.no_kitty)) {
         if (try isImageFile(&head_buf)) {
             try renderImage(&file, stdout);
             return;
