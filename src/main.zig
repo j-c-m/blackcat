@@ -18,6 +18,7 @@ const Usage =
     \\  -e                        equivalent to -vE
     \\  -E, --show-ends           display $ at end of each line
     \\  -k, --no-image            disable image rendering via Kitty protocol
+    \\  -K, --image-only          only render images via Kitty protocol (incompatible with -k)
     \\  -n, --number              number all output lines
     \\  -s, --squeeze-blank       suppress repeated empty output lines
     \\  -t                        equivalent to -vT
@@ -68,6 +69,7 @@ const Options = struct {
     ansi: bool,
     ansi_width: usize,
     kitty: bool,
+    kitty_only: bool,
 };
 
 // --- CP437+ANSI Terminal Emulation Types ---
@@ -373,6 +375,7 @@ pub fn main() !void {
         .ansi = false,
         .ansi_width = 80,
         .kitty = false,
+        .kitty_only = false,
     };
 
     var has_files = false;
@@ -427,6 +430,10 @@ pub fn main() !void {
                 options.kitty = true;
                 continue;
             }
+            if (std.mem.eql(u8, arg, "--image-only")) {
+                options.kitty_only = true;
+                continue;
+            }
             if (std.mem.eql(u8, arg, "--number")) {
                 if (!options.number_nonblank) options.number = true;
                 continue;
@@ -474,6 +481,9 @@ pub fn main() !void {
                         'k' => {
                             options.kitty = true;
                         },
+                        'K' => {
+                            options.kitty_only = true;
+                        },
                         'n' => {
                             if (!options.number_nonblank) options.number = true;
                         },
@@ -498,6 +508,11 @@ pub fn main() !void {
             }
             // If we reach here, it's not an option, so stop processing options and treat as file
             processing_options = false;
+
+            if (options.kitty and options.kitty_only) {
+                std.debug.print("{s}: Incompatible arguments\n", .{prog_name});
+                return;
+            }
         }
         // treat as file
         try catFile(arg, options);
@@ -517,7 +532,8 @@ fn catFile(
     var file: std.fs.File = undefined;
     var file_opened = false;
 
-    if (is_stdin) {
+    // kitty images from stdin not supported
+    if (is_stdin and !options.kitty_only) {
         file = std.fs.File.stdin();
     } else {
         file = std.fs.cwd().openFile(filename, .{ .mode = .read_only }) catch {
@@ -546,9 +562,13 @@ fn catFile(
     }
 
     // Image detection (only for files, not stdin)
-    if (!is_stdin and !options.kitty) {
+    if (options.kitty_only or (!is_stdin and !options.kitty)) {
         if (try isImageFile(&head_buf)) {
             try renderImage(&file, stdout);
+            return;
+        }
+        if (options.kitty_only) {
+            std.debug.print("{s}: {s}: Not an image file\n", .{prog_name, filename});
             return;
         }
     }
