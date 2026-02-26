@@ -4,7 +4,7 @@ const base64 = std.base64;
 const build_options = @import("build_options");
 
 const Usage =
-    \\USAGE: {s} [OPTION]... [FILE]...
+    \\USAGE: {0s} [OPTION]... [FILE]...
     \\
     \\Concatenate FILE(s) to standard output.
     \\
@@ -27,8 +27,8 @@ const Usage =
     \\      --version             output version information and exit
     \\
     \\EXAMPLES
-    \\  cat f - g      Output f's contents, then stdin, then g's contents.
-    \\  cat            Copy stdin to stdout.
+    \\  {0s} f - g      Output f's contents, then stdin, then g's contents.
+    \\  {0s}            Copy stdin to stdout.
     \\
 ;
 
