@@ -7,6 +7,17 @@ A modern cat written in Zig (https://ziglang.org)
 * Support for CP437/DOS to Unicode conversion (auto-detected)
 * Mostly GNU cat compatible otherwise
 
+## Installation
+
+**Homebrew** (https://brew.sh):
+```bash
+brew install j-c-m/tap/blackcat
+```
+
+**Linux / FreeBSD**
+
+Compiled binaries are available for the latest release [here](https://github.com/j-c-m/blackcat/releases/latest)
+
 ## Usage
 
 ```
