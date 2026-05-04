@@ -56,13 +56,6 @@ fn build_release(
     };
     const optimize = .ReleaseSmall;
 
-    var version = std.ArrayList(u8).initCapacity(b.allocator, 0) catch unreachable;
-    defer version.deinit(b.allocator);
-    gen_version(b, version.writer(b.allocator)) catch unreachable;
-    const write_file_step = b.addWriteFiles();
-    const version_file = write_file_step.add("version", version.items);
-    b.getInstallStep().dependOn(&b.addInstallFile(version_file, "version").step);
-
     for (targets) |t| {
         const target = b.resolveTargetQuery(t);
         var triple = std.mem.splitScalar(u8, t.zigTriple(b.allocator) catch unreachable, '-');
@@ -133,13 +126,4 @@ fn build_exe(
     });
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     test_step.dependOn(&run_exe_unit_tests.step);
-}
-
-fn gen_version(b: *std.Build, writer: anytype) !void {
-    var code: u8 = 0;
-    const describe = try b.runAllowFail(&[_][]const u8{ "git", "describe", "--always", "--tags" }, &code, .Ignore);
-    const diff_ = try b.runAllowFail(&[_][]const u8{ "git", "diff", "--stat", "--patch", "HEAD" }, &code, .Ignore);
-    const diff = std.mem.trimRight(u8, diff_, "\r\n ");
-    const version = std.mem.trimRight(u8, describe, "\r\n ");
-    try writer.print("{s}{s}", .{ version, if (diff.len > 0) "-dirty" else "" });
 }
