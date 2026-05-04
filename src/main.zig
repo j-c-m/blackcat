@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 const zigimg = @import("zigimg");
 const base64 = std.base64;
 const build_options = @import("build_options");
@@ -203,7 +204,7 @@ const AnsiTerminal = struct {
         // Ignore other commands for now
     }
 
-    pub fn render(self: *AnsiTerminal, writer: *std.io.Writer) !void {
+    pub fn render(self: *AnsiTerminal, writer: *std.Io.Writer) !void {
         for (self.screen.items) |row| {
             var current_fg: ?u8 = null;
             var current_bg: ?u8 = null;
@@ -241,10 +242,11 @@ const AnsiTerminal = struct {
         }
     }
 
-    pub fn renderFile(allocator: std.mem.Allocator, file: *std.fs.File, writer: *std.io.Writer, width: usize) !void {
+    pub fn renderFile(allocator: std.mem.Allocator, file: *std.Io.File, writer: *std.Io.Writer, width: usize) !void {
         var content = try std.ArrayList(u8).initCapacity(allocator, 1024);
         defer content.deinit(allocator);
-        while (file.read(&catbuf)) |len| {
+        const iov = [_][]u8{&catbuf};
+        while (file.readStreaming(io, &iov)) |len| {
             if (len == 0) break;
             try content.appendSlice(allocator, catbuf[0..len]);
         } else |err| {
@@ -341,13 +343,14 @@ fn parseSauceWidth(sauce_block: []const u8) usize {
     return if (width > 0) width else 80;
 }
 
-fn checkSauce(file: *std.fs.File) !?usize {
+fn checkSauce(file: *std.Io.File) !?usize {
     const sauce_size: usize = 128;
     var buf: [sauce_size]u8 = undefined;
-    const file_size = try file.getEndPos();
+    const file_size = try file.length(io);
     if (file_size < sauce_size) return null;
-    try file.seekTo(file_size - sauce_size);
-    const n = try file.readAll(&buf);
+    //try file.seekTo(file_size - sauce_size);
+    const iov = [_][]u8{&buf};
+    const n = try file.readPositional(io, &iov, file_size - sauce_size);
     if (n != sauce_size) return null;
     if (!std.mem.eql(u8, buf[0..5], "SAUCE")) return null;
     return parseSauceWidth(&buf);
@@ -355,11 +358,18 @@ fn checkSauce(file: *std.fs.File) !?usize {
 
 var catbuf: [65536]u8 = undefined;
 var stdoutbuf: [65536]u8 = undefined;
-var stdoutwriter = std.fs.File.stdout().writer(&stdoutbuf);
-const stdout = &stdoutwriter.interface;
+var stdoutwriter: Io.File.Writer = undefined;
+var stdout: *Io.Writer = undefined;
+var io: Io = undefined;
 
-pub fn main() !void {
-    var args = std.process.args();
+pub fn main(init: std.process.Init) !void {
+    const arena: std.mem.Allocator = init.arena.allocator();
+    var args = try init.minimal.args.iterateAllocator(arena);
+    defer args.deinit();
+
+    io = init.io;
+    stdoutwriter = .init(.stdout(), io, &stdoutbuf);
+    stdout = &stdoutwriter.interface;
     defer stdout.flush() catch {};
 
     var options: Options = .{
@@ -390,7 +400,7 @@ pub fn main() !void {
                 return;
             }
             if (std.mem.eql(u8, arg, "--version")) {
-                try stdout.print("{s} {s}\n", .{prog_name, version});
+                try stdout.print("{s} {s}\n", .{ prog_name, version });
                 return;
             }
             if (std.mem.startsWith(u8, arg, "--ansi=")) {
@@ -514,35 +524,35 @@ fn catFile(
     options: Options,
 ) !void {
     const is_stdin = std.mem.eql(u8, filename, "-");
-    var file: std.fs.File = undefined;
+    var file: std.Io.File = undefined;
     var file_opened = false;
 
     if (is_stdin) {
-        file = std.fs.File.stdin();
+        file = std.Io.File.stdin();
     } else {
-        file = std.fs.cwd().openFile(filename, .{ .mode = .read_only }) catch {
-            std.debug.print("{s}: {s}: No such file or directory\n", .{prog_name, filename});
+        file = std.Io.Dir.cwd().openFile(io, filename, .{ .mode = .read_only }) catch {
+            std.debug.print("{s}: {s}: No such file or directory\n", .{ prog_name, filename });
             return;
         };
         file_opened = true;
     }
-    defer if (file_opened) file.close();
+    defer if (file_opened) file.close(io);
 
     var line_num: usize = 1;
 
     var detected_cp437: bool = options.cp437;
     var detected_ansi: bool = options.ansi;
     var head_buf: [1024]u8 = undefined;
+    const hov = [_][]u8{&head_buf};
 
     if (!is_stdin) {
-        const len = file.read(&head_buf) catch |err| {
-            std.debug.print("{s}: {s}: {}\n", .{prog_name, filename, err});
+        const len = file.readPositional(io, &hov, 0) catch |err| {
+            std.debug.print("{s}: {s}: {}\n", .{ prog_name, filename, err });
             return;
         };
         if (len == 0) {
             return;
         }
-        try file.seekTo(0);
     }
 
     // Image detection (only for files, not stdin)
@@ -563,9 +573,8 @@ fn catFile(
         if (try checkSauce(&file)) |width| {
             sauce_width = width;
             detected_ansi = true;
-            //try writer.print("[SAUCE metadata detected: width={d}]\n", .{sauce_width});
+            //std.debug.print("[SAUCE metadata detected: width={d}]\n", .{sauce_width});
         }
-        try file.seekTo(0);
     }
 
     if (detected_ansi) {
@@ -579,7 +588,7 @@ fn catFile(
         !options.squeeze_blank and !is_stdin)
     {
         fastCat(&file, stdout) catch |err| {
-            std.debug.print("{s}: {s}: {}\n", .{prog_name, filename, err});
+            std.debug.print("{s}: {s}: {}\n", .{ prog_name, filename, err });
         };
         return;
     }
@@ -587,7 +596,8 @@ fn catFile(
     var prev: u8 = '\n';
     var squeeze: bool = false;
 
-    while (file.read(&catbuf)) |len| {
+    const iov = [_][]u8{&catbuf};
+    while (file.readStreaming(io, &iov)) |len| {
         if (len == 0) return;
         for (catbuf[0..len]) |ch| {
             if (prev == '\n') {
@@ -656,18 +666,23 @@ fn catFile(
         }
         try stdout.flush();
     } else |err| {
-        std.debug.print("{s}: {s}: {}\n", .{prog_name, filename, err});
-        return err;
+        if (err != error.EndOfStream) {
+            std.debug.print("{s}: {s}: {}\n", .{ prog_name, filename, err });
+            return err;
+        }
     }
 }
 
-fn fastCat(file: *std.fs.File, writer: *std.io.Writer) !void {
-    while (file.read(&catbuf)) |len| {
+fn fastCat(file: *std.Io.File, writer: *std.Io.Writer) !void {
+    const iov = [_][]u8{&catbuf};
+    while (file.readStreaming(io, &iov)) |len| {
         if (len == 0) break;
         try writer.writeAll(catbuf[0..len]);
         try writer.flush();
     } else |err| {
-        return err;
+        if (err != error.EndOfStream) {
+            return err;
+        }
     }
 }
 
@@ -683,29 +698,30 @@ const Winsize = extern struct {
     ws_ypixel: u16,
 };
 
-fn renderImage(file: *std.fs.File, writer: *std.io.Writer) !void {
+fn renderImage(file: *std.Io.File, writer: *std.Io.Writer) !void {
     const allocator = std.heap.page_allocator;
-    var img = try zigimg.Image.fromFile(allocator, file.*, &catbuf);
+    var img = try zigimg.Image.fromFile(allocator, io, file.*, &catbuf);
     defer img.deinit(allocator);
 
     const original_width = img.width;
     const original_height = img.height;
 
     // Get terminal size
-    var term_cols: u16 = 80;
-    var term_rows: u16 = 24;
+    var ws_col: u16 = 80;
+    var ws_row: u16 = 24;
+    var ws_xpixel: u16 = 10 * ws_col;
+    var ws_ypixel: u16 = 20 * ws_row;
     var winsize: Winsize = undefined;
     if (std.posix.system.ioctl(1, std.posix.system.T.IOCGWINSZ, @intFromPtr(&winsize)) == 0) {
-        term_cols = winsize.ws_col;
-        term_rows = winsize.ws_row;
+        ws_col = winsize.ws_col;
+        ws_row = winsize.ws_row;
+        ws_xpixel = winsize.ws_xpixel;
+        ws_ypixel = winsize.ws_ypixel;
     }
 
-    const CELL_WIDTH: f32 = 8.0;
-    const CELL_HEIGHT: f32 = 16.0;
-
     // Calculate max pixel dimensions
-    const max_pixel_w: f32 = @as(f32, @floatFromInt(term_cols)) * CELL_WIDTH;
-    const max_pixel_h: f32 = @as(f32, @floatFromInt(term_rows)) * CELL_HEIGHT;
+    const max_pixel_w: f32 = @as(f32, @floatFromInt(ws_xpixel - ((ws_xpixel / ws_col) * 6)));
+    const max_pixel_h: f32 = @as(f32, @floatFromInt(ws_ypixel - ((ws_ypixel / ws_row) * 3)));
 
     // Calculate scale
     const img_w: f32 = @floatFromInt(original_width);
@@ -736,6 +752,23 @@ fn renderImage(file: *std.fs.File, writer: *std.io.Writer) !void {
         try byte_data.append(allocator, px.a);
     }
 
+    // Compress the raw RGBA data using zlib
+    //var compressed = try std.Io.Writer.Allocating.initCapacity(allocator, byte_data.items.len);
+    //defer compressed.deinit();
+
+    //var deflate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+    //var compress = try std.compress.flate.Compress.init(
+    //    &compressed.writer,
+    //    &deflate_buffer,
+    //    .zlib,
+    //    .default,
+    //);
+
+    //try compress.writer.writeAll(byte_data.items);
+    //try compress.finish();
+
+    //const ai = compressed.toArrayList();
+
     // Encode RGBA byte data to base64 for kitty
     var encoded = try std.ArrayList(u8).initCapacity(allocator, byte_data.items.len * 4 / 3);
     defer encoded.deinit(allocator);
@@ -757,13 +790,13 @@ fn renderImage(file: *std.fs.File, writer: *std.io.Writer) !void {
         const end1 = start + chunk_size;
         try writer.print("\x1B_Gf=32,s={d},v={d},a=T,m=1;{s}\x1B\\", .{ img.width, img.height, data[start..end1] });
         start = end1;
-        // Middle chunks with m=1
+        // Middle chunks with Gm=1
         while (start + chunk_size < data.len) {
             const end = start + chunk_size;
             try writer.print("\x1B_Gm=1;{s}\x1B\\", .{data[start..end]});
             start = end;
         }
-        // Last chunk with m=0
+        // Last chunk with Gm=0
         if (start < data.len) {
             try writer.print("\x1B_Gm=0;{s}\x1B\\", .{data[start..]});
         }
@@ -809,16 +842,11 @@ fn resizeImage(alloc: std.mem.Allocator, img: *zigimg.Image, new_w: u32, new_h: 
             const p10 = img.pixels.rgba32[@as(usize, y1) * original_width + x0];
             const p11 = img.pixels.rgba32[@as(usize, y1) * original_width + x1];
 
-            const r = (1 - dx) * (1 - dy) * @as(f32, @floatFromInt(p00.r)) + dx * (1 - dy) * @as(f32, @floatFromInt(p01.r)) + (1 - dx) * dy * @as(f32, @floatFromInt(p10.r)) + dx * dy * @as(f32, @floatFromInt(p11.r));
-            const g = (1 - dx) * (1 - dy) * @as(f32, @floatFromInt(p00.g)) + dx * (1 - dy) * @as(f32, @floatFromInt(p01.g)) + (1 - dx) * dy * @as(f32, @floatFromInt(p10.g)) + dx * dy * @as(f32, @floatFromInt(p11.g));
-            const b = (1 - dx) * (1 - dy) * @as(f32, @floatFromInt(p00.b)) + dx * (1 - dy) * @as(f32, @floatFromInt(p01.b)) + (1 - dx) * dy * @as(f32, @floatFromInt(p10.b)) + dx * dy * @as(f32, @floatFromInt(p11.b));
-            const a = (1 - dx) * (1 - dy) * @as(f32, @floatFromInt(p00.a)) + dx * (1 - dy) * @as(f32, @floatFromInt(p01.a)) + (1 - dx) * dy * @as(f32, @floatFromInt(p10.a)) + dx * dy * @as(f32, @floatFromInt(p11.a));
-
             new_pixels[y * new_w + x] = .{
-                .r = @intFromFloat(@round(r)),
-                .g = @intFromFloat(@round(g)),
-                .b = @intFromFloat(@round(b)),
-                .a = @intFromFloat(@round(a)),
+                .r = lerp8(p00.r, p01.r, p10.r, p11.r, dx, dy),
+                .g = lerp8(p00.g, p01.g, p10.g, p11.g, dx, dy),
+                .b = lerp8(p00.b, p01.b, p10.b, p11.b, dx, dy),
+                .a = lerp8(p00.a, p01.a, p10.a, p11.a, dx, dy),
             };
         }
     }
@@ -829,4 +857,18 @@ fn resizeImage(alloc: std.mem.Allocator, img: *zigimg.Image, new_w: u32, new_h: 
     img.height = new_h;
 
     return;
+}
+
+inline fn lerp8(v00: u8, v01: u8, v10: u8, v11: u8, dx: f32, dy: f32) u8 {
+    const f00 = @as(f32, @floatFromInt(v00));
+    const f01 = @as(f32, @floatFromInt(v01));
+    const f10 = @as(f32, @floatFromInt(v10));
+    const f11 = @as(f32, @floatFromInt(v11));
+
+    const value = (1 - dx) * (1 - dy) * f00 +
+        dx * (1 - dy) * f01 +
+        (1 - dx) * dy * f10 +
+        dx * dy * f11;
+
+    return @intFromFloat(@round(value));
 }

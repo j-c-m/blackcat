@@ -1,12 +1,12 @@
 .{
     .name = .blackcat,
-    .version = "0.4.5",
+    .version = "0.5.0",
     .fingerprint = 0x2bf865e42216aa17, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zigimg = .{
-            .url = "git+https://github.com/zigimg/zigimg.git#d7717b3617d58160635623fe86d4bf86065498e0",
-            .hash = "zigimg-0.1.0-8_eo2vBrFQAvZmO9NzDP85_qC5JFksuMdyI_KMMEr4bq",
+            .url = "git+https://github.com/zigimg/zigimg.git#c7e81a13bff1cf4c5b7f085a8360f9d551143d40",
+            .hash = "zigimg-0.1.0-8_eo2uScFwCnpzB1Y2n_jf3euDfMEeCLxJE_E5_W5BNe",
         },
     },
     .paths = .{
