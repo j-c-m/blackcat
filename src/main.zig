@@ -543,10 +543,10 @@ fn catFile(
     var detected_cp437: bool = options.cp437;
     var detected_ansi: bool = options.ansi;
     var head_buf: [1024]u8 = undefined;
-    const hov = [_][]u8{&head_buf};
 
     if (!is_stdin) {
-        const len = file.readPositional(io, &hov, 0) catch |err| {
+        const iov = [_][]u8{&head_buf};
+        const len = file.readPositional(io, &iov, 0) catch |err| {
             std.debug.print("{s}: {s}: {}\n", .{ prog_name, filename, err });
             return;
         };
@@ -753,21 +753,24 @@ fn renderImage(file: *std.Io.File, writer: *std.Io.Writer) !void {
     }
 
     // Compress the raw RGBA data using zlib
-    //var compressed = try std.Io.Writer.Allocating.initCapacity(allocator, byte_data.items.len);
-    //defer compressed.deinit();
+    if (true) {
+        var compressed = try std.Io.Writer.Allocating.initCapacity(allocator, byte_data.items.len);
+        defer compressed.deinit();
 
-    //var deflate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
-    //var compress = try std.compress.flate.Compress.init(
-    //    &compressed.writer,
-    //    &deflate_buffer,
-    //    .zlib,
-    //    .default,
-    //);
+        var deflate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+        var compress = try std.compress.flate.Compress.init(
+            &compressed.writer,
+            &deflate_buffer,
+            .zlib,
+            .fastest,
+        );
 
-    //try compress.writer.writeAll(byte_data.items);
-    //try compress.finish();
+        try compress.writer.writeAll(byte_data.items);
+        try compress.finish();
 
-    //const ai = compressed.toArrayList();
+        const ai = compressed.toArrayList();
+        byte_data = ai;
+    }
 
     // Encode RGBA byte data to base64 for kitty
     var encoded = try std.ArrayList(u8).initCapacity(allocator, byte_data.items.len * 4 / 3);
@@ -782,27 +785,27 @@ fn renderImage(file: *std.Io.File, writer: *std.Io.Writer) !void {
     const data = encoded.items;
     var start: usize = 0;
     if (data.len == 0) {
-        // Handle empty image, perhaps skip
-    } else if (data.len <= chunk_size) {
-        try writer.print("\x1B_Gf=32,s={d},v={d},a=T;{s}\x1B\\", .{ img.width, img.height, data });
-    } else {
-        // First chunk with m=1
-        const end1 = start + chunk_size;
-        try writer.print("\x1B_Gf=32,s={d},v={d},a=T,m=1;{s}\x1B\\", .{ img.width, img.height, data[start..end1] });
-        start = end1;
-        // Middle chunks with Gm=1
-        while (start + chunk_size < data.len) {
-            const end = start + chunk_size;
-            try writer.print("\x1B_Gm=1;{s}\x1B\\", .{data[start..end]});
-            start = end;
-        }
-        // Last chunk with Gm=0
-        if (start < data.len) {
-            try writer.print("\x1B_Gm=0;{s}\x1B\\", .{data[start..]});
-        }
+        // Handle empty image, skip
+        return;
     }
+
+    while (start < data.len) {
+        const end = @min(start + chunk_size, data.len);
+        if (start == 0) {
+            // "Header chunk" with m=1
+            try writer.print("\x1B_Gf=32,o=z,s={d},v={d},a=T,m=1;{s}\x1B\\", .{ img.width, img.height, data[start..end] });
+        } else {
+            // "Payload chunk" with m=1
+            try writer.print("\x1B_Gm=1;{s}\x1B\\", .{data[start..end]});
+        }
+        start = end;
+    }
+    // "End chunk" with m=0
+    try writer.print("\x1B_Gm=0;\x1B\\", .{});
+
     try writer.print("\n\n", .{});
     try writer.flush();
+    std.debug.print("bytes sent: {d}\n", .{data.len});
 }
 
 // Bilinear image resizing
