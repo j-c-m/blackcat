@@ -805,7 +805,7 @@ fn renderImage(file: *std.Io.File, writer: *std.Io.Writer) !void {
 
     try writer.print("\n\n", .{});
     try writer.flush();
-    std.debug.print("bytes sent: {d}\n", .{data.len});
+    //std.debug.print("bytes sent: {d}\n", .{data.len});
 }
 
 // Bilinear image resizing
