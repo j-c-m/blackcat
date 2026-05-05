@@ -558,7 +558,9 @@ fn catFile(
     // Image detection (only for files, not stdin)
     if (!is_stdin and !options.kitty) {
         if (try isImageFile(&head_buf)) {
-            try renderImage(&file, stdout);
+            renderImage(&file, stdout) catch |err| {
+                std.debug.print("{s}: {s}: {}\n", .{ prog_name, filename, err });
+            };
             return;
         }
     }
