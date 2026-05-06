@@ -4,6 +4,8 @@ const zigimg = @import("zigimg");
 const base64 = std.base64;
 const build_options = @import("build_options");
 
+const sauce = @import("sauce.zig");
+
 const Usage =
     \\USAGE: {0s} [OPTION]... [FILE]...
     \\
@@ -332,30 +334,6 @@ fn sampleForCp437(head_buf: []const u8) !bool {
     return has_high_byte and has_crlf(head_buf[0..]);
 }
 
-fn isSauceCandidate(filename: []const u8) bool {
-    const ext = std.fs.path.extension(filename);
-    return std.ascii.eqlIgnoreCase(ext, ".ans") or std.ascii.eqlIgnoreCase(ext, ".asc");
-}
-
-fn parseSauceWidth(sauce_block: []const u8) usize {
-    if (sauce_block.len < 96) return 80;
-    const width = @as(usize, sauce_block[96]) + (@as(usize, sauce_block[97]) << 8);
-    return if (width > 0) width else 80;
-}
-
-fn checkSauce(file: *std.Io.File) !?usize {
-    const sauce_size: usize = 128;
-    var buf: [sauce_size]u8 = undefined;
-    const file_size = try file.length(io);
-    if (file_size < sauce_size) return null;
-    //try file.seekTo(file_size - sauce_size);
-    const iov = [_][]u8{&buf};
-    const n = try file.readPositional(io, &iov, file_size - sauce_size);
-    if (n != sauce_size) return null;
-    if (!std.mem.eql(u8, buf[0..5], "SAUCE")) return null;
-    return parseSauceWidth(&buf);
-}
-
 var catbuf: [65536]u8 = undefined;
 var stdoutbuf: [65536]u8 = undefined;
 var stdoutwriter: Io.File.Writer = undefined;
@@ -545,8 +523,7 @@ fn catFile(
     var head_buf: [1024]u8 = undefined;
 
     if (!is_stdin) {
-        const iov = [_][]u8{&head_buf};
-        const len = file.readPositional(io, &iov, 0) catch |err| {
+        const len = file.readPositionalAll(io, &head_buf, 0) catch |err| {
             std.debug.print("{s}: {s}: {}\n", .{ prog_name, filename, err });
             return;
         };
@@ -571,11 +548,18 @@ fn catFile(
     }
 
     var sauce_width = options.ansi_width;
-    if (!is_stdin and isSauceCandidate(filename)) {
-        if (try checkSauce(&file)) |width| {
-            sauce_width = width;
+    if (!is_stdin and sauce.isSauceCandidate(filename)) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        if (try sauce.getSauce(alloc, io, &file)) |sauce_data| {
+            sauce_width = sauce_data.metadata.getWidth();
             detected_ansi = true;
-            //std.debug.print("[SAUCE metadata detected: width={d}]\n", .{sauce_width});
+            //std.debug.print("SAUCE: {d} comments\n", .{sauce_data.metadata.comments});
+            //for (sauce_data.comments) |line| {
+            //    std.debug.print("SAUCE Comment: '{s}'\n", .{line});
+            //}
         }
     }
 
@@ -701,7 +685,10 @@ const Winsize = extern struct {
 };
 
 fn renderImage(file: *std.Io.File, writer: *std.Io.Writer) !void {
-    const allocator = std.heap.page_allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
     var img = try zigimg.Image.fromFile(allocator, io, file.*, &catbuf);
     defer img.deinit(allocator);
 
