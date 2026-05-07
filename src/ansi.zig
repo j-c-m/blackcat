@@ -242,3 +242,43 @@ pub const AnsiTerminal = struct {
         try term.render(writer);
     }
 };
+
+// --- CRLF / format detection helpers ---
+
+pub fn hasCrlf(buf: []const u8) bool {
+    var last_was_cr = false;
+    for (buf) |b| {
+        if (last_was_cr and b == '\n') {
+            return true;
+        } else if (b == '\r') {
+            last_was_cr = true;
+        } else {
+            last_was_cr = false;
+        }
+    }
+    return false;
+}
+
+pub fn sampleForAnsi(buf: []const u8) !bool {
+    var has_ansi = false;
+    var i: usize = 0;
+    while (i < buf.len) : (i += 1) {
+        const b = buf[i];
+        if (i + 1 < buf.len and b == 0x1B and buf[i + 1] == '[') {
+            has_ansi = true;
+            break;
+        }
+    }
+    return has_ansi and hasCrlf(buf);
+}
+
+pub fn sampleForCp437(buf: []const u8) !bool {
+    var has_high_byte = false;
+    for (buf) |b| {
+        if (b >= 128) {
+            has_high_byte = true;
+            break;
+        }
+    }
+    return has_high_byte and hasCrlf(buf);
+}

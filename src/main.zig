@@ -53,46 +53,6 @@ const Options = struct {
     kitty: bool,
 };
 
-// --- CRLF detection helper ---
-fn has_crlf(lbuf: []const u8) bool {
-    var last_was_cr = false;
-    for (lbuf) |b| {
-        if (last_was_cr and b == '\n') {
-            return true;
-        } else if (b == '\r') {
-            last_was_cr = true;
-        } else {
-            last_was_cr = false;
-        }
-    }
-    return false;
-}
-
-// --- ANSI detection helper ---
-fn sampleForAnsi(head_buf: []const u8) !bool {
-    var has_ansi = false;
-    var i: usize = 0;
-    while (i < head_buf.len) : (i += 1) {
-        const b = head_buf[i];
-        if (i + 1 < head_buf.len and b == 0x1B and head_buf[i + 1] == '[') {
-            has_ansi = true;
-            break;
-        }
-    }
-    return has_ansi and has_crlf(head_buf[0..]);
-}
-
-fn sampleForCp437(head_buf: []const u8) !bool {
-    var has_high_byte = false;
-    for (head_buf[0..]) |b| {
-        if (b >= 128) {
-            has_high_byte = true;
-            break;
-        }
-    }
-    return has_high_byte and has_crlf(head_buf[0..]);
-}
-
 var catbuf: [65536]u8 = undefined;
 var stdoutbuf: [65536]u8 = undefined;
 var stdoutwriter: Io.File.Writer = undefined;
@@ -302,8 +262,8 @@ fn catFile(
     }
 
     if (!is_stdin) {
-        if (!options.cp437) detected_cp437 = try sampleForCp437(&head_buf);
-        if (!options.ansi) detected_ansi = try sampleForAnsi(&head_buf);
+        if (!options.cp437) detected_cp437 = try ansi.sampleForCp437(&head_buf);
+        if (!options.ansi) detected_ansi = try ansi.sampleForAnsi(&head_buf);
     }
 
     var sauce_width = options.ansi_width;
