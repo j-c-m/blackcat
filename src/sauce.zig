@@ -144,7 +144,7 @@ pub fn getSauce(
             errdefer alloc.free(comments);
 
             for (0..num_comments) |i| {
-                const trimmed = std.mem.trimEnd(u8, comment_buf[i * comment_size .. i + 1 * comment_size], " ");
+                const trimmed = std.mem.trimEnd(u8, comment_buf[i * comment_size .. (i + 1) * comment_size], " ");
                 comments[i] = try alloc.dupe(u8, trimmed);
             }
 
