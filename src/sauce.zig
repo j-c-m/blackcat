@@ -81,12 +81,6 @@ pub fn isSauceCandidate(filename: []const u8) bool {
     return std.ascii.eqlIgnoreCase(ext, ".ans") or std.ascii.eqlIgnoreCase(ext, ".asc");
 }
 
-pub fn parseSauceWidth(sauce_block: []const u8) usize {
-    if (sauce_block.len < 96) return 80;
-    const width = @as(usize, sauce_block[96]) + (@as(usize, sauce_block[97]) << 8);
-    return if (width > 0) width else 80;
-}
-
 /// Parse full SAUCE metadata from buffer (little-endian portable).
 pub fn parseSauceMetadata(buf: []const u8) ?SauceMetadata {
     if (buf.len < 128) return null;
@@ -140,21 +134,17 @@ pub fn getSauce(
         const has_valid_header = if (len == 5 and std.mem.eql(u8, &comment_id, "COMNT")) true else false;
 
         if (has_valid_header) {
-            const comment_buf = try alloc.alloc(u8, comment_size * num_comments);
-            errdefer alloc.free(comment_buf);
-
-            _ = try file.readPositionalAll(io, comment_buf, sauce_pos - (num_comments * comment_size));
-
             comments = try alloc.alloc([]u8, num_comments);
             errdefer for (comments) |line| alloc.free(line);
             errdefer alloc.free(comments);
 
             for (0..num_comments) |i| {
-                const trimmed = std.mem.trimEnd(u8, comment_buf[i * comment_size .. (i + 1) * comment_size], " ");
+                var chunk: [comment_size]u8 = undefined;
+                const offset = sauce_pos - ((num_comments - i) * comment_size);
+                _ = try file.readPositionalAll(io, &chunk, offset);
+                const trimmed = std.mem.trimEnd(u8, &chunk, " ");
                 comments[i] = try alloc.dupe(u8, trimmed);
             }
-
-            alloc.free(comment_buf);
         }
     }
 
