@@ -6,6 +6,12 @@ pub const Sauce = struct {
     metadata: SauceMetadata,
     /// Trimmed comment lines (empty lines preserved).
     comments: [][]u8,
+
+    pub fn deinit(self: Sauce, a: std.mem.Allocator) void {
+        if (self.comments.len == 0) return;
+        for (self.comments) |line| a.free(line);
+        a.free(self.comments);
+    }
 };
 
 pub const SauceMetadata = struct {
