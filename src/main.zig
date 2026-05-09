@@ -57,17 +57,15 @@ const Options = struct {
 
 var catbuf: [65536]u8 = undefined;
 var stdoutbuf: [65536]u8 = undefined;
-var stdoutwriter: Io.File.Writer = undefined;
 var stdout: *Io.Writer = undefined;
-var io: Io = undefined;
 
 pub fn main(init: std.process.Init) !void {
+    const io: Io = init.io;
     const arena: std.mem.Allocator = init.arena.allocator();
     var args = try init.minimal.args.iterateAllocator(arena);
     defer args.deinit();
 
-    io = init.io;
-    stdoutwriter = .init(.stdout(), io, &stdoutbuf);
+    var stdoutwriter: Io.File.Writer = .init(.stdout(), io, &stdoutbuf);
     stdout = &stdoutwriter.interface;
     defer stdout.flush() catch {};
 
@@ -209,16 +207,17 @@ pub fn main(init: std.process.Init) !void {
             processing_options = false;
         }
         // treat as file
-        try catFile(arg, options);
+        try catFile(io, arg, options);
         has_files = true;
     }
 
     if (!has_files) {
-        try catFile("-", options);
+        try catFile(io, "-", options);
     }
 }
 
 fn catFile(
+    io: std.Io,
     filename: []const u8,
     options: Options,
 ) !void {
@@ -294,7 +293,7 @@ fn catFile(
         !options.number and !options.number_nonblank and
         !options.squeeze_blank and !is_stdin)
     {
-        fastCat(&file, stdout) catch |err| {
+        fastCat(io, &file, stdout) catch |err| {
             std.debug.print("{s}: {s}: {}\n", .{ prog_name, filename, err });
         };
         return;
@@ -380,7 +379,7 @@ fn catFile(
     }
 }
 
-fn fastCatPositional(file: *std.Io.File, writer: *std.Io.Writer) !void {
+fn fastCatPositional(io: std.Io, file: *std.Io.File, writer: *std.Io.Writer) !void {
     var offset: u64 = 0;
     while (file.readPositionalAll(io, &catbuf, offset)) |len| {
         if (len == 0) break;
@@ -394,7 +393,7 @@ fn fastCatPositional(file: *std.Io.File, writer: *std.Io.Writer) !void {
     }
 }
 
-fn fastCatSendfile(file: *std.Io.File, writer: *std.Io.Writer) !void {
+fn fastCatSendfile(io: std.Io, file: *std.Io.File, writer: *std.Io.Writer) !void {
     var file_reader = file.reader(io, &catbuf);
     _ = try writer.sendFileAll(&file_reader, .unlimited);
 }
