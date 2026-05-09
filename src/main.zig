@@ -3,6 +3,7 @@ const Io = std.Io;
 const zigimg = @import("zigimg");
 const base64 = std.base64;
 const build_options = @import("build_options");
+const builtin = @import("builtin");
 
 const sauce = @import("sauce.zig");
 const ansi = @import("ansi.zig");
@@ -379,15 +380,27 @@ fn catFile(
     }
 }
 
-fn fastCat(file: *std.Io.File, writer: *std.Io.Writer) !void {
-    const iov = [_][]u8{&catbuf};
-    while (file.readStreaming(io, &iov)) |len| {
+fn fastCatPositional(file: *std.Io.File, writer: *std.Io.Writer) !void {
+    var offset: u64 = 0;
+    while (file.readPositionalAll(io, &catbuf, offset)) |len| {
         if (len == 0) break;
         try writer.writeAll(catbuf[0..len]);
         try writer.flush();
+        offset += len;
     } else |err| {
         if (err != error.EndOfStream) {
             return err;
         }
     }
 }
+
+fn fastCatSendfile(file: *std.Io.File, writer: *std.Io.Writer) !void {
+    var file_reader = file.reader(io, &catbuf);
+    _ = try writer.sendFileAll(&file_reader, .unlimited);
+}
+
+// For some reason sendfileAll is slow on macOS, use readPositionalAll instead
+const fastCat = if (builtin.os.tag == .macos)
+    fastCatPositional
+else
+    fastCatSendfile;
