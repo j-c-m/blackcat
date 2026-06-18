@@ -62,14 +62,10 @@ pub fn renderImage(alloc: std.mem.Allocator, io: std.Io, file: *std.Io.File, wri
     }
 
     // Prepare byte array for RGBA data
-    var byte_data = try std.ArrayList(u8).initCapacity(allocator, img.pixels.rgba32.len * 4);
+    const raw_bytes = std.mem.sliceAsBytes(img.pixels.rgba32);
+    var byte_data = try std.ArrayList(u8).initCapacity(allocator, raw_bytes.len);
     defer byte_data.deinit(allocator);
-    for (img.pixels.rgba32) |px| {
-        try byte_data.append(allocator, px.r);
-        try byte_data.append(allocator, px.g);
-        try byte_data.append(allocator, px.b);
-        try byte_data.append(allocator, px.a);
-    }
+    try byte_data.appendSlice(allocator, raw_bytes);
 
     // Compress the raw RGBA data using zlib
     if (true) {
