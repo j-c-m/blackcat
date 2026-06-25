@@ -27,7 +27,7 @@ fn build_development(
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    build_exe(
+    const exe = build_exe(
         b,
         run_step,
         test_step,
@@ -37,6 +37,7 @@ fn build_development(
         //strip orelse false,
         pie,
     );
+    build_cat_compat_test(b, test_step, exe, target, optimize);
 }
 
 fn build_release(
@@ -63,7 +64,7 @@ fn build_release(
         const os = triple.next() orelse unreachable;
         const target_path = std.mem.join(b.allocator, "-", &[_][]const u8{ os, arch }) catch unreachable;
 
-        build_exe(
+        _ = build_exe(
             b,
             run_step,
             test_step,
@@ -76,6 +77,33 @@ fn build_release(
     }
 }
 
+fn build_cat_compat_test(
+    b: *std.Build,
+    test_step: *std.Build.Step,
+    exe: *std.Build.Step.Compile,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const test_options = b.addOptions();
+    test_options.addOptionPath("blackcat_exe", exe.getEmittedBin());
+
+    const compat_mod = b.createModule(.{
+        .root_source_file = b.path("tests/cat_compat.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compat_mod.addOptions("test_options", test_options);
+
+    const compat_tests = b.addTest(.{
+        .root_module = compat_mod,
+    });
+    compat_tests.step.dependOn(b.getInstallStep());
+
+    const run_compat = b.addRunArtifact(compat_tests);
+    run_compat.step.dependOn(b.getInstallStep());
+    test_step.dependOn(&run_compat.step);
+}
+
 fn build_exe(
     b: *std.Build,
     run_step: *std.Build.Step,
@@ -85,7 +113,7 @@ fn build_exe(
     exe_install_options: std.Build.Step.InstallArtifact.Options,
     //strip: bool,
     pie: ?bool,
-) void {
+) *std.Build.Step.Compile {
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -126,4 +154,6 @@ fn build_exe(
     });
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    return exe;
 }
