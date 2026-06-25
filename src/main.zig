@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
     var args = try init.minimal.args.iterateAllocator(arena);
     defer args.deinit();
 
-    var stdoutwriter: Io.File.Writer = .init(.stdout(), io, &stdoutbuf);
+    var stdoutwriter: Io.File.Writer = .initStreaming(.stdout(), io, &stdoutbuf);
     stdout = &stdoutwriter.interface;
     defer stdout.flush() catch {};
 
