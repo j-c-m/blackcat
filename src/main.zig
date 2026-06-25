@@ -317,10 +317,10 @@ fn catFile(
                 }
 
                 if (options.number and !options.number_nonblank) {
-                    try stdout.print("{d:>6}  ", .{line_num});
+                    try stdout.print("{d:>6}\t", .{line_num});
                     line_num += 1;
                 } else if (options.number_nonblank and ch != '\n') {
-                    try stdout.print("{d:>6}  ", .{line_num});
+                    try stdout.print("{d:>6}\t", .{line_num});
                     line_num += 1;
                 }
             }
