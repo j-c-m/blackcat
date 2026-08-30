@@ -9,6 +9,10 @@ const sauce = @import("sauce.zig");
 const ansi = @import("ansi.zig");
 const image = @import("image.zig");
 
+test {
+    _ = image;
+}
+
 const Usage =
     \\USAGE: {0s} [OPTION]... [FILE]...
     \\

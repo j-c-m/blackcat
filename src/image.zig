@@ -1,5 +1,26 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const zigimg = @import("zigimg");
+
+const kitty_chunk_size = 4096;
+const shm_probe_timeout_ms: i32 = 100;
+const shm_name_max = 31;
+const shm_create_retries = 16;
+const shm_dummy_rgb = [_]u8{ 1, 2, 3 };
+
+const ShmSupport = enum { unknown, yes, no };
+var shm_support: ShmSupport = .unknown;
+var test_force_shm_create_error: ?anyerror = null;
+
+var probe_tty_fd: std.posix.fd_t = -1;
+var probe_saved_termios: ?std.posix.termios = null;
+var probe_dummy_name_buf: [shm_name_max + 1:0]u8 = [_:0]u8{0} ** (shm_name_max + 1);
+var probe_dummy_linux_path_buf: [64:0]u8 = [_:0]u8{0} ** 64;
+var probe_dummy_name_z: ?[*:0]const u8 = null;
+var probe_dummy_linux_path_z: ?[*:0]const u8 = null;
+var probe_old_int: std.posix.Sigaction = undefined;
+var probe_old_term: std.posix.Sigaction = undefined;
+var probe_handlers_live: bool = false;
 
 const Winsize = extern struct {
     ws_row: u16,
@@ -8,12 +29,141 @@ const Winsize = extern struct {
     ws_ypixel: u16,
 };
 
+const TransmitShm = enum { sent, local_fail };
+
+const ProbeParse = enum { need_more, ok, fail, da1 };
+
+const ProbeParser = struct {
+    want_id: u32,
+    buf: [1024]u8 = undefined,
+    len: usize = 0,
+    saw_ok: bool = false,
+    saw_fail: bool = false,
+    saw_da1: bool = false,
+
+    fn done(self: ProbeParser) bool {
+        return self.saw_ok or self.saw_fail or self.saw_da1;
+    }
+
+    fn result(self: ProbeParser) ProbeParse {
+        if (self.saw_ok) return .ok;
+        if (self.saw_fail) return .fail;
+        if (self.saw_da1) return .da1;
+        return .need_more;
+    }
+
+    fn feed(self: *ProbeParser, chunk: []const u8) ProbeParse {
+        appendBuf(&self.buf, &self.len, chunk);
+        var i: usize = 0;
+        while (i < self.len) {
+            if (self.buf[i] != 0x1b) {
+                i += 1;
+                continue;
+            }
+            if (i + 1 >= self.len) break;
+            if (self.buf[i + 1] == '_') {
+                const parsed = parseApc(self.buf[i..self.len]) orelse break;
+                if (parsed.id) |id| {
+                    if (id == self.want_id) {
+                        if (parsed.ok) self.saw_ok = true else self.saw_fail = true;
+                    }
+                }
+                i += parsed.len;
+                continue;
+            }
+            if (self.buf[i + 1] == '[') {
+                if (parseDa1(self.buf[i..self.len])) |n| {
+                    self.saw_da1 = true;
+                    i += n;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        if (i > 0) {
+            const remain = self.len - i;
+            std.mem.copyForwards(u8, self.buf[0..remain], self.buf[i..self.len]);
+            self.len = remain;
+        }
+        return self.result();
+    }
+};
+
+const ApcParse = struct {
+    len: usize,
+    id: ?u32,
+    ok: bool,
+};
+
+const ShmObject = struct {
+    name_buf: [shm_name_max + 1:0]u8 = [_:0]u8{0} ** (shm_name_max + 1),
+    name_len: usize = 0,
+    file: std.Io.File = .{ .handle = -1, .flags = .{ .nonblocking = false } },
+    map: ?[]align(std.heap.page_size_min) u8 = null,
+    fd_open: bool = false,
+
+    fn posixName(self: *const ShmObject) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+
+    fn posixNameZ(self: *const ShmObject) [:0]const u8 {
+        return self.name_buf[0..self.name_len :0];
+    }
+
+    fn unmap(self: *ShmObject) void {
+        if (self.map) |m| {
+            std.posix.munmap(m);
+            self.map = null;
+        }
+    }
+
+    fn closeFd(self: *ShmObject, io: std.Io) void {
+        if (self.fd_open) {
+            self.file.close(io);
+            self.fd_open = false;
+            self.file.handle = -1;
+        }
+    }
+
+    fn unlink(self: *const ShmObject, io: std.Io) void {
+        shmUnlinkName(io, self.posixNameZ().ptr);
+    }
+
+    fn destroy(self: *ShmObject, io: std.Io) void {
+        self.unmap();
+        self.closeFd(io);
+        self.unlink(io);
+    }
+};
+
+const ProbeSession = struct {
+    tty: std.Io.File,
+    saved: std.posix.termios,
+    dummy: ShmObject,
+    deadline: std.Io.Clock.Timestamp,
+    parser: ProbeParser,
+    finished: bool = false,
+
+    fn finish(self: *ProbeSession, io: std.Io) void {
+        finishProbe(self, io);
+    }
+};
+
 pub fn isImageFile(head_buf: []const u8) !bool {
     _ = zigimg.Image.detectFormatFromMemory(head_buf[0..]) catch return false;
     return true;
 }
 
 pub fn renderImage(alloc: std.mem.Allocator, io: std.Io, file: *std.Io.File, writer: *std.Io.Writer) !void {
+    const stdout_tty = std.Io.File.stdout().isTty(io) catch false;
+    var probe: ?ProbeSession = null;
+    defer if (probe) |*p| p.finish(io);
+
+    const eligible = stdout_tty and shmAvailable();
+    if (eligible and shm_support == .unknown) {
+        probe = startProbe(io, writer) catch null;
+    }
+
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -25,7 +175,6 @@ pub fn renderImage(alloc: std.mem.Allocator, io: std.Io, file: *std.Io.File, wri
     const original_width = img.width;
     const original_height = img.height;
 
-    // Get terminal size
     var ws_col: u16 = 80;
     var ws_row: u16 = 24;
     var ws_xpixel: u16 = 10 * ws_col;
@@ -38,37 +187,30 @@ pub fn renderImage(alloc: std.mem.Allocator, io: std.Io, file: *std.Io.File, wri
         ws_ypixel = winsize.ws_ypixel;
     }
 
-    // Calculate max pixel dimensions
     const max_pixel_w: f32 = @as(f32, @floatFromInt(ws_xpixel - ((ws_xpixel / ws_col) * 6)));
     const max_pixel_h: f32 = @as(f32, @floatFromInt(ws_ypixel - ((ws_ypixel / ws_row) * 3)));
 
-    // Calculate scale
     const img_w: f32 = @floatFromInt(original_width);
     const img_h: f32 = @floatFromInt(original_height);
     const scale_x: f32 = max_pixel_w / img_w;
     const scale_y: f32 = max_pixel_h / img_h;
     const scale: f32 = @min(scale_x, scale_y);
 
-    // New dimensions
     const new_w: u32 = @intFromFloat(scale * img_w);
     const new_h: u32 = @intFromFloat(scale * img_h);
 
-    // Convert to RGBA (kitty f=32)
     try img.convert(allocator, .rgba32);
 
-    // Resize if needed
     if (new_w < original_width or new_h < original_height) {
         try resizeImage(allocator, &img, new_w, new_h);
     }
 
-    // Prepare byte array for RGBA data
     const raw_bytes = std.mem.sliceAsBytes(img.pixels.rgba32);
     var byte_data = try std.ArrayList(u8).initCapacity(allocator, raw_bytes.len);
     defer byte_data.deinit(allocator);
     try byte_data.appendSlice(allocator, raw_bytes);
 
-    // Compress the raw RGBA data using zlib
-    if (true) {
+    {
         var compressed = try std.Io.Writer.Allocating.initCapacity(allocator, byte_data.items.len);
         defer compressed.deinit();
 
@@ -87,40 +229,482 @@ pub fn renderImage(alloc: std.mem.Allocator, io: std.Io, file: *std.Io.File, wri
         byte_data = ai;
     }
 
-    // Encode RGBA byte data to base64 for kitty
-    var encoded = try std.ArrayList(u8).initCapacity(allocator, byte_data.items.len * 4 / 3);
-    defer encoded.deinit(allocator);
-    const out_len = std.base64.standard.Encoder.calcSize(byte_data.items.len);
-    try encoded.resize(allocator, out_len);
-    _ = std.base64.standard.Encoder.encode(encoded.items, byte_data.items);
-
-    try writer.print("\n     ", .{});
-    // Output Kitty sequence in 4096 byte chunks
-    const chunk_size = 4096;
-    const data = encoded.items;
-    var start: usize = 0;
-    if (data.len == 0) {
-        // Handle empty image, skip
-        return;
+    if (probe) |*p| {
+        p.finish(io);
+        probe = null;
     }
 
+    try writer.print("\n     ", .{});
+    if (byte_data.items.len == 0) return;
+
+    if (eligible and shm_support == .yes) {
+        switch (try transmitShm(io, writer, byte_data.items, img.width, img.height)) {
+            .sent => {},
+            .local_fail => try transmitDirect(allocator, writer, byte_data.items, img.width, img.height),
+        }
+    } else {
+        try transmitDirect(allocator, writer, byte_data.items, img.width, img.height);
+    }
+    try writer.print("\n\n", .{});
+    try writer.flush();
+}
+
+fn shmAvailable() bool {
+    return switch (builtin.os.tag) {
+        .linux, .macos, .freebsd => true,
+        else => false,
+    };
+}
+
+fn resetShmSupportForTest() void {
+    shm_support = .unknown;
+    test_force_shm_create_error = null;
+}
+
+fn currentPid() u32 {
+    const raw = std.posix.system.getpid();
+    return std.math.cast(u32, raw) orelse @truncate(@as(u64, @bitCast(@as(i64, raw))));
+}
+
+fn formatShmName(buf: *[shm_name_max + 1:0]u8, pid: u32, rand: u32) [:0]u8 {
+    const printed = std.fmt.bufPrintZ(buf, "/bc{x:0>8}{x:0>8}", .{ pid, rand }) catch unreachable;
+    return printed;
+}
+
+fn linuxShmPath(posix_name: []const u8, path_buf: *[64]u8) ?[]const u8 {
+    if (posix_name.len < 2 or posix_name[0] != '/') return null;
+    return std.fmt.bufPrint(path_buf, "/dev/shm/{s}", .{posix_name[1..]}) catch null;
+}
+
+fn exclusiveCreate(name_z: [*:0]const u8) !std.posix.fd_t {
+    switch (builtin.os.tag) {
+        .linux => {
+            var path_buf: [64]u8 = undefined;
+            const path = linuxShmPath(std.mem.span(name_z), &path_buf) orelse return error.NameTooLong;
+            return std.posix.openat(std.posix.AT.FDCWD, path, .{
+                .ACCMODE = .RDWR,
+                .CREAT = true,
+                .EXCL = true,
+                .CLOEXEC = true,
+            }, 0o600);
+        },
+        .macos, .freebsd => {
+            const flags: std.posix.O = .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true };
+            const rc = std.c.shm_open(name_z, @bitCast(flags), @as(std.c.mode_t, 0o600));
+            if (rc < 0) {
+                return switch (std.posix.errno(rc)) {
+                    .EXIST => error.PathAlreadyExists,
+                    .NOENT => error.FileNotFound,
+                    .ACCES => error.AccessDenied,
+                    else => error.ShmOpenFailed,
+                };
+            }
+            return rc;
+        },
+        else => return error.ShmUnsupported,
+    }
+}
+
+fn shmUnlinkName(io: std.Io, posix_name_z: [*:0]const u8) void {
+    switch (builtin.os.tag) {
+        .linux => {
+            var path_buf: [64]u8 = undefined;
+            const path = linuxShmPath(std.mem.span(posix_name_z), &path_buf) orelse return;
+            std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+        },
+        .macos, .freebsd => {
+            _ = std.c.shm_unlink(posix_name_z);
+        },
+        else => {},
+    }
+}
+
+fn createShm(io: std.Io, data: []const u8) !ShmObject {
+    if (builtin.is_test) {
+        if (test_force_shm_create_error) |e| return e;
+    }
+    if (data.len == 0) return error.InvalidSize;
+    if (!shmAvailable()) return error.ShmUnsupported;
+
+    const pid = currentPid();
+    var attempt: u8 = 0;
+    while (attempt < shm_create_retries) : (attempt += 1) {
+        var rand_buf: [4]u8 = undefined;
+        io.random(&rand_buf);
+        const rand = std.mem.readInt(u32, &rand_buf, .little);
+
+        var name_buf: [shm_name_max + 1:0]u8 = [_:0]u8{0} ** (shm_name_max + 1);
+        const name_z = formatShmName(&name_buf, pid, rand);
+
+        const fd = exclusiveCreate(name_z.ptr) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+
+        var obj = ShmObject{
+            .name_buf = name_buf,
+            .name_len = name_z.len,
+            .file = .{ .handle = fd, .flags = .{ .nonblocking = false } },
+            .fd_open = true,
+        };
+        errdefer obj.destroy(io);
+
+        try obj.file.setLength(io, data.len);
+        const map = try std.posix.mmap(
+            null,
+            data.len,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+        obj.map = map;
+        @memcpy(map[0..data.len], data);
+        return obj;
+    }
+    return error.PathAlreadyExists;
+}
+
+fn encodeNameB64(posix_name: []const u8, b64_buf: *[64]u8) []const u8 {
+    const n = std.base64.standard.Encoder.calcSize(posix_name.len);
+    std.debug.assert(n <= b64_buf.len);
+    return std.base64.standard.Encoder.encode(b64_buf[0..n], posix_name);
+}
+
+fn writeDirectApc(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    compressed: []const u8,
+    width: usize,
+    height: usize,
+) !void {
+    if (compressed.len == 0) return;
+
+    const out_len = std.base64.standard.Encoder.calcSize(compressed.len);
+    var encoded = try std.ArrayList(u8).initCapacity(allocator, out_len);
+    defer encoded.deinit(allocator);
+    try encoded.resize(allocator, out_len);
+    _ = std.base64.standard.Encoder.encode(encoded.items, compressed);
+
+    const data = encoded.items;
+    var start: usize = 0;
     while (start < data.len) {
-        const end = @min(start + chunk_size, data.len);
+        const end = @min(start + kitty_chunk_size, data.len);
         if (start == 0) {
-            // "Header chunk" with m=1
-            try writer.print("\x1B_Gf=32,o=z,s={d},v={d},a=T,m=1;{s}\x1B\\", .{ img.width, img.height, data[start..end] });
+            try writer.print("\x1B_Gf=32,o=z,s={d},v={d},a=T,m=1;{s}\x1B\\", .{ width, height, data[start..end] });
         } else {
-            // "Payload chunk" with m=1
             try writer.print("\x1B_Gm=1;{s}\x1B\\", .{data[start..end]});
         }
         start = end;
     }
-    // "End chunk" with m=0
     try writer.print("\x1B_Gm=0;\x1B\\", .{});
+}
 
-    try writer.print("\n\n", .{});
+fn transmitDirect(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    compressed: []const u8,
+    width: usize,
+    height: usize,
+) !void {
+    try writeDirectApc(allocator, writer, compressed, width, height);
+}
+
+fn writeShmApc(
+    writer: *std.Io.Writer,
+    posix_name: []const u8,
+    data_size: usize,
+    width: usize,
+    height: usize,
+) !void {
+    var b64_buf: [64]u8 = undefined;
+    const b64 = encodeNameB64(posix_name, &b64_buf);
+    try writer.print(
+        "\x1B_Gf=32,o=z,s={d},v={d},a=T,t=s,S={d};{s}\x1B\\",
+        .{ width, height, data_size, b64 },
+    );
+}
+
+fn transmitShm(
+    io: std.Io,
+    writer: *std.Io.Writer,
+    compressed: []const u8,
+    width: usize,
+    height: usize,
+) !TransmitShm {
+    var obj = createShm(io, compressed) catch return .local_fail;
+    obj.unmap();
+    obj.closeFd(io);
+    errdefer obj.unlink(io);
+
+    try writeShmApc(writer, obj.posixName(), compressed.len, width, height);
     try writer.flush();
-    //std.debug.print("bytes sent: {d}\n", .{data.len});
+    return .sent;
+}
+
+fn randomImageId(io: std.Io) u32 {
+    while (true) {
+        var buf: [4]u8 = undefined;
+        io.random(&buf);
+        const id = std.mem.readInt(u32, &buf, .little);
+        if (id != 0) return id;
+    }
+}
+
+fn clearProbeGlobals() void {
+    probe_tty_fd = -1;
+    probe_saved_termios = null;
+    probe_dummy_name_buf = [_:0]u8{0} ** (shm_name_max + 1);
+    probe_dummy_linux_path_buf = [_:0]u8{0} ** 64;
+    probe_dummy_name_z = null;
+    probe_dummy_linux_path_z = null;
+    probe_handlers_live = false;
+}
+
+fn restoreProbeHandlers() void {
+    if (!probe_handlers_live) return;
+    std.posix.sigaction(.INT, &probe_old_int, null);
+    std.posix.sigaction(.TERM, &probe_old_term, null);
+    probe_handlers_live = false;
+}
+
+fn unlinkDummyFromHandler() void {
+    switch (builtin.os.tag) {
+        .linux => {
+            if (probe_dummy_linux_path_z) |p| {
+                _ = std.os.linux.unlink(p);
+            }
+        },
+        .macos, .freebsd => {
+            if (probe_dummy_name_z) |p| {
+                _ = std.c.shm_unlink(p);
+            }
+        },
+        else => {},
+    }
+}
+
+fn probeSignalHandler(sig: std.posix.SIG) callconv(.c) void {
+    if (probe_saved_termios) |saved| {
+        if (probe_tty_fd >= 0) {
+            std.posix.tcsetattr(probe_tty_fd, .NOW, saved) catch {};
+        }
+    }
+    unlinkDummyFromHandler();
+    if (sig == .INT) {
+        std.posix.sigaction(.INT, &probe_old_int, null);
+    } else if (sig == .TERM) {
+        std.posix.sigaction(.TERM, &probe_old_term, null);
+    }
+    probe_handlers_live = false;
+    _ = std.posix.raise(sig) catch {};
+}
+
+fn installProbeHandlers(tty_fd: std.posix.fd_t, saved: std.posix.termios, posix_name: []const u8) void {
+    @memset(probe_dummy_name_buf[0..], 0);
+    const n = @min(posix_name.len, probe_dummy_name_buf.len - 1);
+    @memcpy(probe_dummy_name_buf[0..n], posix_name[0..n]);
+    probe_dummy_name_buf[n] = 0;
+    probe_dummy_name_z = &probe_dummy_name_buf;
+
+    if (builtin.os.tag == .linux) {
+        @memset(probe_dummy_linux_path_buf[0..], 0);
+        _ = std.fmt.bufPrintZ(&probe_dummy_linux_path_buf, "/dev/shm/{s}", .{posix_name[1..]}) catch {};
+        probe_dummy_linux_path_z = &probe_dummy_linux_path_buf;
+    }
+
+    probe_tty_fd = tty_fd;
+    probe_saved_termios = saved;
+
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = probeSignalHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.INT, &act, &probe_old_int);
+    std.posix.sigaction(.TERM, &act, &probe_old_term);
+    probe_handlers_live = true;
+}
+
+fn startProbe(io: std.Io, writer: *std.Io.Writer) !ProbeSession {
+    const tty = std.Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_only }) catch {
+        shm_support = .no;
+        return error.NoControllingTty;
+    };
+    errdefer shm_support = .no;
+    errdefer tty.close(io);
+
+    const saved = std.posix.tcgetattr(tty.handle) catch {
+        shm_support = .no;
+        return error.NotATerminal;
+    };
+
+    var dummy = createShm(io, &shm_dummy_rgb) catch |err| {
+        shm_support = .no;
+        return err;
+    };
+    dummy.unmap();
+    dummy.closeFd(io);
+    errdefer dummy.unlink(io);
+
+    var term = saved;
+    term.lflag.ICANON = false;
+    term.lflag.ECHO = false;
+    term.cc[@intFromEnum(std.posix.V.MIN)] = 0;
+    term.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+    try std.posix.tcsetattr(tty.handle, .NOW, term);
+    errdefer std.posix.tcsetattr(tty.handle, .NOW, saved) catch {};
+
+    errdefer clearProbeGlobals();
+    var handlers_installed = false;
+    installProbeHandlers(tty.handle, saved, dummy.posixName());
+    handlers_installed = true;
+    errdefer if (handlers_installed) restoreProbeHandlers();
+
+    const image_id = randomImageId(io);
+    var b64_buf: [64]u8 = undefined;
+    const b64 = encodeNameB64(dummy.posixName(), &b64_buf);
+    try writer.print(
+        "\x1B_Gi={d},s=1,v=1,a=q,t=s,f=24,S=3;{s}\x1B\\\x1B[c",
+        .{ image_id, b64 },
+    );
+    try writer.flush();
+
+    const timeout: std.Io.Clock.Duration = .{
+        .raw = .fromMilliseconds(shm_probe_timeout_ms),
+        .clock = .awake,
+    };
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, timeout);
+
+    return .{
+        .tty = tty,
+        .saved = saved,
+        .dummy = dummy,
+        .deadline = deadline,
+        .parser = .{ .want_id = image_id },
+    };
+}
+
+fn finishProbe(session: *ProbeSession, io: std.Io) void {
+    if (session.finished) return;
+    session.finished = true;
+
+    if (!session.parser.done()) {
+        var fds = [_]std.posix.pollfd{.{
+            .fd = session.tty.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        while (!session.parser.done()) {
+            const remaining = session.deadline.durationFromNow(io);
+            const rem_ms = remaining.raw.toMilliseconds();
+            const poll_ms: i32 = if (rem_ms <= 0) 0 else @intCast(@min(rem_ms, @as(i64, shm_probe_timeout_ms)));
+            _ = std.posix.poll(&fds, poll_ms) catch break;
+            if (poll_ms == 0 and (fds[0].revents & std.posix.POLL.IN) == 0) break;
+            if ((fds[0].revents & std.posix.POLL.IN) == 0) {
+                if (poll_ms == 0) break;
+                continue;
+            }
+            var tmp: [256]u8 = undefined;
+            const n = std.posix.read(session.tty.handle, &tmp) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => break,
+            };
+            if (n == 0) break;
+            _ = session.parser.feed(tmp[0..n]);
+        }
+    }
+
+    restoreProbeHandlers();
+    std.posix.tcsetattr(session.tty.handle, .NOW, session.saved) catch {};
+
+    const ok = session.parser.saw_ok;
+    shm_support = if (ok) .yes else .no;
+    if (!ok) session.dummy.unlink(io);
+    session.tty.close(io);
+    clearProbeGlobals();
+}
+
+fn appendBuf(buf: *[1024]u8, len: *usize, chunk: []const u8) void {
+    if (len.* + chunk.len <= buf.len) {
+        @memcpy(buf[len.*..][0..chunk.len], chunk);
+        len.* += chunk.len;
+        return;
+    }
+    const keep = buf.len / 2;
+    if (len.* > keep) {
+        std.mem.copyForwards(u8, buf[0..keep], buf[len.* - keep .. len.*]);
+        len.* = keep;
+    }
+    const room = buf.len - len.*;
+    const take = @min(chunk.len, room);
+    @memcpy(buf[len.*..][0..take], chunk[chunk.len - take ..]);
+    len.* += take;
+}
+
+fn parseI(control: []const u8) ?u32 {
+    var rest = control;
+    while (rest.len > 0) {
+        if (rest.len >= 2 and rest[0] == 'i' and rest[1] == '=') {
+            rest = rest[2..];
+            var val: u32 = 0;
+            var any = false;
+            while (rest.len > 0 and rest[0] >= '0' and rest[0] <= '9') {
+                any = true;
+                val = val *% 10 + (rest[0] - '0');
+                rest = rest[1..];
+            }
+            if (any) return val;
+            return null;
+        }
+        if (std.mem.indexOfScalar(u8, rest, ',')) |idx| {
+            rest = rest[idx + 1 ..];
+        } else break;
+    }
+    return null;
+}
+
+fn parseApc(bytes: []const u8) ?ApcParse {
+    if (bytes.len < 3) return null;
+    if (bytes[0] != 0x1b or bytes[1] != '_' or bytes[2] != 'G') return null;
+    const semi = std.mem.indexOfScalarPos(u8, bytes, 3, ';') orelse return null;
+    var end: usize = semi + 1;
+    while (end < bytes.len) : (end += 1) {
+        if (bytes[end] == 0x07) {
+            const payload = bytes[semi + 1 .. end];
+            return .{
+                .len = end + 1,
+                .id = parseI(bytes[3..semi]),
+                .ok = std.mem.eql(u8, payload, "OK"),
+            };
+        }
+        if (bytes[end] == 0x1b) {
+            if (end + 1 >= bytes.len) return null;
+            if (bytes[end + 1] == '\\') {
+                const payload = bytes[semi + 1 .. end];
+                return .{
+                    .len = end + 2,
+                    .id = parseI(bytes[3..semi]),
+                    .ok = std.mem.eql(u8, payload, "OK"),
+                };
+            }
+        }
+    }
+    return null;
+}
+
+fn parseDa1(bytes: []const u8) ?usize {
+    if (bytes.len < 3) return null;
+    if (bytes[0] != 0x1b or bytes[1] != '[') return null;
+    var i: usize = 2;
+    if (i < bytes.len and bytes[i] == '?') i += 1;
+    while (i < bytes.len) : (i += 1) {
+        const c = bytes[i];
+        if (c == 'c') return i + 1;
+        const is_param = (c >= '0' and c <= '9') or c == ';';
+        if (!is_param) return null;
+    }
+    return null;
 }
 
 fn resizeImage(alloc: std.mem.Allocator, img: *zigimg.Image, new_w: u32, new_h: u32) !void {
@@ -186,4 +770,174 @@ inline fn lerp8(v00: u8, v01: u8, v10: u8, v11: u8, dx: f32, dy: f32) u8 {
         dx * dy * f11;
 
     return @intFromFloat(@round(value));
+}
+
+fn decodeB64Payload(apc: []const u8) ![]u8 {
+    const semi = std.mem.lastIndexOfScalar(u8, apc, ';') orelse return error.NoPayload;
+    var end = apc.len;
+    if (end >= 2 and apc[end - 2] == 0x1b and apc[end - 1] == '\\') {
+        end -= 2;
+    } else if (end >= 1 and apc[end - 1] == 0x07) {
+        end -= 1;
+    }
+    const encoded = apc[semi + 1 .. end];
+    const out_len = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+    const out = try std.testing.allocator.alloc(u8, out_len);
+    try std.base64.standard.Decoder.decode(out, encoded);
+    return out;
+}
+
+test "formatShmName Darwin limit" {
+    var buf: [shm_name_max + 1:0]u8 = [_:0]u8{0} ** (shm_name_max + 1);
+    const name = formatShmName(&buf, 0x00001a2b, 0x3c4d5e6f);
+    try std.testing.expectEqual(@as(usize, 19), name.len);
+    try std.testing.expect(name.len <= 31);
+    try std.testing.expectEqual(@as(u8, '/'), name[0]);
+    try std.testing.expect(std.mem.indexOfScalar(u8, name[1..], '/') == null);
+    try std.testing.expectEqualStrings("/bc00001a2b3c4d5e6f", name);
+}
+
+test "writeDirectApc framing" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const payload = "abc";
+    try writeDirectApc(std.testing.allocator, &aw.writer, payload, 2, 3);
+    const out = aw.written();
+    try std.testing.expect(std.mem.startsWith(u8, out, "\x1b_Gf=32,o=z,s=2,v=3,a=T,m=1;"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b_Gm=0;\x1b\\"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "t=s") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b_Gm=1;") == null);
+}
+
+test "writeDirectApc empty writes nothing" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeDirectApc(std.testing.allocator, &aw.writer, &.{}, 1, 1);
+    try std.testing.expectEqual(@as(usize, 0), aw.written().len);
+}
+
+test "writeDirectApc chunks at 4096" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const raw = [_]u8{0xaa} ** 4000;
+    try writeDirectApc(std.testing.allocator, &aw.writer, &raw, 10, 10);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b_Gm=1;") != null);
+    var it = std.mem.splitSequence(u8, out, "\x1b_");
+    _ = it.next();
+    while (it.next()) |frame| {
+        const body_end = std.mem.indexOfScalar(u8, frame, ';') orelse continue;
+        const payload = frame[body_end + 1 ..];
+        const payload_only = if (payload.len >= 2 and payload[payload.len - 2] == 0x1b)
+            payload[0 .. payload.len - 2]
+        else
+            payload;
+        try std.testing.expect(payload_only.len <= kitty_chunk_size);
+    }
+}
+
+test "writeShmApc framing" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const name = "/bc0000000100000002";
+    try writeShmApc(&aw.writer, name, 12, 4, 5);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "t=s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "o=z") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "S=12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "m=") == null);
+    const decoded = try decodeB64Payload(out);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings(name, decoded);
+}
+
+test "probe parser OK APC" {
+    var p = ProbeParser{ .want_id = 31 };
+    try std.testing.expectEqual(ProbeParse.ok, p.feed("\x1b_Gi=31;OK\x1b\\"));
+}
+
+test "probe parser fail APC" {
+    var p = ProbeParser{ .want_id = 31 };
+    try std.testing.expectEqual(ProbeParse.fail, p.feed("\x1b_Gi=31;EINVAL: invalid data\x1b\\"));
+}
+
+test "probe parser DA1" {
+    var p = ProbeParser{ .want_id = 1 };
+    try std.testing.expectEqual(ProbeParse.da1, p.feed("\x1b[?1;0c"));
+}
+
+test "probe parser split frames" {
+    var p = ProbeParser{ .want_id = 7 };
+    try std.testing.expectEqual(ProbeParse.need_more, p.feed("\x1b_Gi=7;O"));
+    try std.testing.expectEqual(ProbeParse.ok, p.feed("K\x1b\\"));
+}
+
+test "probe parser ignores unmatched i=" {
+    var p = ProbeParser{ .want_id = 2 };
+    try std.testing.expectEqual(ProbeParse.need_more, p.feed("\x1b_Gi=99;OK\x1b\\"));
+    try std.testing.expectEqual(ProbeParse.ok, p.feed("\x1b_Gi=2;OK\x1b\\"));
+}
+
+test "probe parser BEL terminator" {
+    var p = ProbeParser{ .want_id = 4 };
+    try std.testing.expectEqual(ProbeParse.ok, p.feed("\x1b_Gi=4;OK\x07"));
+}
+
+test "createShm empty is InvalidSize" {
+    resetShmSupportForTest();
+    try std.testing.expectError(error.InvalidSize, createShm(std.testing.io, &.{}));
+}
+
+test "create-fail returns local_fail then direct" {
+    resetShmSupportForTest();
+    test_force_shm_create_error = error.FileNotFound;
+    defer resetShmSupportForTest();
+
+    const io = std.testing.io;
+    try std.testing.expectEqual(TransmitShm.local_fail, try transmitShm(io, undefined, "zlib", 1, 1));
+
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try transmitDirect(std.testing.allocator, &aw.writer, "zlib", 1, 1);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "t=s") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a=T") != null);
+}
+
+test "write-fail does not fall back to direct" {
+    resetShmSupportForTest();
+    if (!shmAvailable()) return error.SkipZigTest;
+
+    var failing: std.Io.Writer = .failing;
+    const result = transmitShm(std.testing.io, &failing, "zlib-bytes", 2, 2);
+    try std.testing.expectError(error.WriteFailed, result);
+}
+
+test "local shm round-trip" {
+    resetShmSupportForTest();
+    if (!shmAvailable()) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    const payload = "hello-shm-payload";
+    var obj = createShm(io, payload) catch return error.SkipZigTest;
+    defer obj.destroy(io);
+
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeShmApc(&aw.writer, obj.posixName(), payload.len, 1, 1);
+    const decoded_name = try decodeB64Payload(aw.written());
+    defer std.testing.allocator.free(decoded_name);
+    try std.testing.expectEqualStrings(obj.posixName(), decoded_name);
+
+    obj.unmap();
+    const map = try std.posix.mmap(
+        null,
+        payload.len,
+        .{ .READ = true },
+        .{ .TYPE = .SHARED },
+        obj.file.handle,
+        0,
+    );
+    defer std.posix.munmap(map);
+    try std.testing.expectEqualStrings(payload, map[0..payload.len]);
 }
