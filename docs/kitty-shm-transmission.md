@@ -6,7 +6,7 @@
 | **Date** | 2026-08-30 |
 | **Status** | Draft |
 | **Product** | blackcat 0.7.3 (Zig 0.16.0) |
-| **Scope** | `src/image.zig` (+ tests) and a small `src/main.zig` wiring change (`TERM`, test seed). No new CLI flags. No temp-file (`t=t`/`t=f`) medium. |
+| **Scope** | `src/image.zig` (+ tests) and a small `src/main.zig` test seed. No new CLI flags. No `TERM` gating. No temp-file (`t=t`/`t=f`) medium. |
 
 ---
 
@@ -14,7 +14,7 @@
 
 `blackcat` already renders named image files through the Kitty graphics protocol, but it always uses in-band direct transmission (`t=d`: zlib-compress RGBA, base64, 4096-byte APC chunks on stdout). That path is correct over SSH and inside multiplexers, and it is the only portable fallback. Locally it is expensive: a typical terminal-sized RGBA frame is ~1–8 MiB uncompressed; after zlib and base64 it is hundreds of kilobytes to several megabytes of escape codes on the PTY.
 
-This design adds POSIX shared-memory transmission (`t=s`) when it can actually help, and keeps the existing direct path otherwise. Detection is a one-shot Kitty query (`a=q` dummy 1×1 RGB + DA1) with a **100 ms remaining-time deadline**, started **before** decode so the wait overlaps work, and **skipped** when `TERM` is not a Kitty-protocol emulator. Result is cached for the process. Local create/mmap failures fall back to `t=d`. Write/flush errors after a shm APC has been issued **do not** fall back to `t=d` (that would emit two images). The client unlinks shm objects it created unless `print` **and** `flush` of the APC succeeded (the terminal unlinks after a successful read).
+This design adds POSIX shared-memory transmission (`t=s`) when it can actually help, and keeps the existing direct path otherwise. Detection is a one-shot Kitty query (`a=q` dummy 1×1 RGB + DA1) with a **100 ms remaining-time deadline**, started **before** decode so the wait overlaps work. There is **no `TERM` allowlist**: a real query is the only runtime signal. Result is cached for the process. Local create/mmap failures fall back to `t=d`. Write/flush errors after a shm APC has been issued **do not** fall back to `t=d` (that would emit two images). The client unlinks shm objects it created unless `print` **and** `flush` of the APC succeeded (the terminal unlinks after a successful read).
 
 ---
 
@@ -48,7 +48,7 @@ There are **no** image-protocol unit tests today. `zig build test` runs the exe 
 - Shared memory is the medium Kitty, Ghostty, and WezTerm prefer for local clients (`kitten icat` probe order: memory → file → stream).
 - shm is **local to the machine that called `shm_open`**. Over SSH the local terminal cannot see remote objects. `SSH_CONNECTION` is not a reliable signal (kitty ssh kitten, etc.).
 - A client that only “tries shm and hopes” will silently fail to display over SSH.
-- A 100 ms query on every tty (Terminal.app, xterm, Linux console) would be a regression versus 0.7.3 for the common `blackcat img.png` case. The cache does not help a one-image process.
+- Non-graphics terminals still answer DA1. The probe stops on DA1-without-OK and uses `t=d`; the 100 ms budget is only for a silent tty. Overlap with decode hides most of the wait on large images.
 
 ### Protocol facts (Kitty graphics)
 
@@ -93,12 +93,12 @@ Query pattern used by `kitten icat` (`kittens/icat/detect.go`):
 
 ### Goals
 
-- Prefer POSIX shm (`t=s`) for local Kitty-protocol terminals when stdout is a tty, `TERM` looks like a Kitty-protocol emulator, and a real query says shm works.
-- Fall back to the existing zlib + base64 + chunked `t=d` path whenever shm cannot be used — without a 100 ms tax on xterm/Terminal.app.
+- Prefer POSIX shm (`t=s`) when stdout is a tty, POSIX shm can be created, and a real query says the terminal can read it.
+- Fall back to the existing zlib + base64 + chunked `t=d` path whenever shm cannot be used. Do not guess from `TERM`.
 - Keep GNU-cat I/O: never consume stdin looking for graphics replies (`blackcat f - g` must still work).
 - Clean up shm objects the client created, except after a successful APC **print+flush** (terminal owns unlink then).
 - No new flags. `-k` / `--no-image` remains the off switch. Default is automatic.
-- Smallest change: stay in `src/image.zig` plus minimal `main.zig` wiring. Extract `transmitDirect` / `transmitShm` / probe helpers. No strategy framework, no new modules.
+- Smallest change: stay in `src/image.zig`. Extract `transmitDirect` / `transmitShm` / probe helpers. No strategy framework, no new modules. `main.zig` only gets `test { _ = image; }` in PR 1.
 - Tests that do not need a live Kitty and **do not** `tcsetattr` the developer’s tty.
 
 ### Non-Goals
@@ -120,7 +120,7 @@ Query pattern used by `kitten icat` (`kittens/icat/detect.go`):
 
 ```mermaid
 flowchart TD
-  A[renderImage] --> T{stdout tty AND shmAvailable AND TERM allowlist?}
+  A[renderImage] --> T{stdout tty AND shmAvailable?}
   T -->|no| Dec[decode, scale, RGBA, zlib]
   T -->|yes| C{process cache}
   C -->|yes| Dec
@@ -150,41 +150,26 @@ Attempt a probe (or use cache=`yes`) only if **all** of:
 
 1. `std.Io.File.stdout().isTty(io)` is true. Writing `t=s` into a redirected file cannot help and can leak objects. `isTty` error → not a tty.
 2. The OS backend can create POSIX shm (`shmAvailable()`: Linux, macOS, FreeBSD). Compile-time `else` → stream, no probe.
-3. `termMayHaveKittyGraphics(term)` is true (see TERM allowlist).
-4. Process cache is `yes`, or `unknown` (then probe). Cache `no` → stream, no probe.
+3. Process cache is `yes`, or `unknown` (then probe). Cache `no` → stream, no probe.
 
-`term` is passed into `renderImage` from `main.zig` via `init.environ_map.get("TERM") orelse ""` (`Environ.Map.get`, Zig 0.16). Unit tests pass `"dumb"` or `"xterm-kitty"` and never call `File.stdout().isTty` on the test process.
+No `TERM` check. Unit tests never call `File.stdout().isTty` on the test process; they drive `writeDirectApc` / `writeShmApc` / `feedProbe` / `createShm` / `transmitShm` directly.
 
-### TERM allowlist
+SSH: stdout is a tty, so we probe. Remote shm is invisible; the query errors or times out → `t=d`. Local-fail-only is still rejected.
 
-**Skip the probe** (immediate `t=d`, 0 ms added) unless `TERM` identifies a Kitty-protocol emulator. Match is case-sensitive, as `TERM` is:
+tmux: we probe. No replies → DA1 or timeout → `t=d`. If `allow-passthrough` delivers `OK`, use shm. **Do not special-case tmux.**
 
-| Needle | Matches |
-| --- | --- |
-| `xterm-kitty` | Kitty default |
-| `xterm-ghostty` | Ghostty |
-| `ghostty` | Ghostty alternate |
-| `wezterm` | `wezterm`, `wezterm-direct`, … |
-| `kitty` | rare `TERM=kitty` |
-
-Match function: equal, **or** `startsWith(needle)` and the next byte is `'-'`. That allows `wezterm-direct` without matching a hypothetical `wezterminal`.
-
-**Not matched** (immediate `t=d`): `xterm`, `xterm-256color`, `linux`, `dumb`, `vt100`, `screen`, `screen-256color`, `tmux`, `tmux-256color`, `rxvt`, empty, unset. WezTerm/iTerm2/Konsole that leave `TERM=xterm-256color` skip shm and display via `t=d` with **no** 100 ms wait. Users who want shm can set `TERM=wezterm` / `xterm-kitty`.
-
-SSH from Kitty: `TERM` is still `xterm-kitty`, so we **do** probe. The query fails or times out (remote shm is invisible) → `t=d`. That 100 ms (often overlapped by decode) is the remaining cost and is required; local-fail-only is still rejected.
-
-tmux: `TERM` is usually `tmux-256color` / `screen-256color` → skip probe, `t=d`. If the user exported `TERM=xterm-kitty` inside tmux, we probe. If `allow-passthrough` delivers `OK`, use shm. **Do not special-case tmux.**
+Non-graphics terminals (Terminal.app, xterm, linux console): they do not answer the graphics `a=q`, but they **do** answer DA1. `finishProbe` sees DA1-without-OK → cache `no` → `t=d`. That is usually much faster than 100 ms. The full timeout is only for a silent tty.
 
 ### Probe-once (not per-image, not local-fail-only)
 
-**Choice: one `a=q` dummy + DA1 per process, 100 ms remaining-time deadline, cache in a `var`, overlapped with decode, TERM-gated.**
+**Choice: one `a=q` dummy + DA1 per process, 100 ms remaining-time deadline, cache in a `var`, overlapped with decode. Probe is the only runtime signal; no `TERM` allowlist.**
 
 | Alternative | Why not |
 | --- | --- |
 | Local-fail-only (try `shm_open`, send `t=s` if it works) | Broken over SSH: remote `shm_open` succeeds, local kitty cannot see the object, image never appears. `SSH_CONNECTION` is insufficient (kitty ssh kitten). |
 | Try `a=T,t=s` with `i=` and resend `t=d` on error | Stalls **every** image waiting for a reply. Also races cleanup. |
 | icat’s 10 s timeout | blackcat is a cat clone. |
-| Probe on every tty, after zlib | 100 ms regression on Terminal.app/xterm; no overlap with decode. |
+| TERM allowlist, skip probe otherwise | Guessing from `TERM` misses WezTerm/iTerm2/Konsole that keep `xterm-256color`, and skips shm that a query would have found. DA1 already distinguishes “no graphics” from “silent tty.” |
 
 False-negative on a slow host: first image uses `t=d` (still works); cache `no` poisons the rest of `blackcat *.png`. Accept; do not retry. False-positive is worse (missing image).
 
@@ -199,7 +184,7 @@ fn resetShmSupportForTest() void {
 }
 ```
 
-Single-threaded CLI; no atomics. Tests **must** call `resetShmSupportForTest()` in setup. Subsequent images in `blackcat a.png b.png` reuse the result. `-k` never reaches `renderImage`. TERM skip does **not** write the cache (re-check is cheap).
+Single-threaded CLI; no atomics. Tests **must** call `resetShmSupportForTest()` in setup. Subsequent images in `blackcat a.png b.png` reuse the result. `-k` never reaches `renderImage`.
 
 Do **not** also probe `t=d`. Today we already emit `t=d` on non-Kitty terminals (garbage APC, existing behavior).
 
@@ -536,7 +521,7 @@ Edge cases:
 
 - `blackcat img.png > /dev/pts/N`: query goes to N; we read the controlling tty and time out → `t=d`. Acceptable.
 - `blackcat img.png \| cat`: stdout not a tty → no probe, `t=d`.
-- `script(1)` / `ssh -t`: still a tty; TERM-gated; may probe. Acceptable.
+- `script(1)` / `ssh -t`: still a tty; we probe. Acceptable.
 - `blackcat img.png -`: probe may consume keystrokes typed in the (remaining) wait window from the same input queue as stdin. After the image, `catFile` returns. Acknowledged; keep stdin unread.
 
 tmux `allow-passthrough` can deliver `OK` for local shm. That correctly uses `t=s`. Do not detect-and-skip tmux.
@@ -663,13 +648,12 @@ pub fn renderImage(
     io: std.Io,
     file: *std.Io.File,
     writer: *std.Io.Writer,
-    term: []const u8,
 ) !void {
     const stdout_tty = std.Io.File.stdout().isTty(io) catch false;
     var probe: ?ProbeSession = null;
     defer if (probe) |*p| p.finish(io); // idempotent; restores termios/signals if decode fails
 
-    const eligible = stdout_tty and shmAvailable() and termMayHaveKittyGraphics(term);
+    const eligible = stdout_tty and shmAvailable();
     if (eligible and shm_support == .unknown) {
         // startProbe is transactional: on error it already restored tty/handlers
         // and unlinked any dummy. catch null is then safe (no ProbeSession to finish).
@@ -714,7 +698,7 @@ Direct chunking: keep the current empty final `m=0` chunk (behavior-preserving).
 
 ## API / Interface Changes
 
-`renderImage` gains `term: []const u8`. `main.zig` `catFile` passes `init.environ_map.get("TERM") orelse ""`. Tests pass a literal and never open the real tty.
+`renderImage` keeps its current signature (no `TERM` argument). Tests never open the real tty.
 
 ### New helpers in `src/image.zig` (Zig 0.16, verified)
 
@@ -769,8 +753,6 @@ fn shmAvailable() bool {
         else => false,
     };
 }
-
-fn termMayHaveKittyGraphics(term: []const u8) bool
 
 fn formatShmName(buf: *[shm_name_max + 1:0]u8, pid: u32, rand: u32) [:0]u8
 
@@ -860,12 +842,7 @@ fn shmUnlinkName(io: std.Io, posix_name_z: [*:0]const u8) void {
 
 ### `main.zig`
 
-```zig
-const term = init.environ_map.get("TERM") orelse "";
-image.renderImage(std.heap.page_allocator, io, &file, stdout, term) catch |err| { ... };
-```
-
-PR 1 adds:
+`renderImage` call site is unchanged except PR 1 adds:
 
 ```zig
 test {
@@ -877,7 +854,7 @@ test {
 
 ## Data Model Changes
 
-None. No files, no config, no new env vars (we only **read** `TERM`).
+None. No files, no config, no new env vars. `TERM` is not read.
 
 Process-local `shm_support` is not persisted. Each `blackcat` invocation probes at most once.
 
@@ -932,23 +909,23 @@ Process-local `shm_support` is not persisted. Each `blackcat` invocation probes 
 - **Cons:** `t=s` payload is a POSIX shm **name**. memfd is not that. `t=f` is a non-goal.
 - **Decision:** Out of scope.
 
-### 9. TERM-gated probe (picked)
+### 9. TERM-gated probe
 
-- **Pros:** 0 ms added on Terminal.app/xterm/linux console/`TERM=xterm-256color`. Typical `blackcat img.png` stays as fast as 0.7.3 unless `TERM` is kitty/ghostty/wezterm.
-- **Cons:** WezTerm/iTerm2/Konsole with generic `TERM=xterm-256color` skip shm (still `t=d`). SSH from Kitty still probes (`TERM` stays `xterm-kitty`).
-- **Decision:** Allowlist as specified. Do not go back to local-fail-only.
+- **Pros:** 0 ms added on Terminal.app/xterm/linux console/`TERM=xterm-256color`.
+- **Cons:** Misses WezTerm/iTerm2/Konsole that keep a generic `TERM`. Duplicates what DA1 already tells us. Extra `main.zig` wiring.
+- **Decision:** Rejected. Probe is enough.
 
 ### 10. Overlap probe with decode (picked)
 
-- **Pros:** Local OK replies are often free on large images; 100 ms is an upper bound on blocking wait, not a tax after zlib.
+- **Pros:** Local OK replies are often free on large images; 100 ms is an upper bound on blocking wait, not a tax after zlib. Non-graphics terminals usually answer DA1 before the deadline.
 - **Cons:** Termios/signals must be restored if decode fails (`defer finishProbe`).
 - **Decision:** `startProbe` before decode, `finishProbe` after zlib with remaining-time `poll`.
 
 ### 11. Probe after zlib on every tty, 100 ms
 
 - **Pros:** Simpler control flow.
-- **Cons:** Product regression vs 0.7.3 on non-Kitty ttys; no overlap.
-- **Decision:** Rejected in favor of 9+10.
+- **Cons:** No overlap; worst-case wait is always after compress.
+- **Decision:** Rejected in favor of 10.
 
 ---
 
@@ -987,7 +964,7 @@ A silent shm→direct fallback is success from the user’s point of view. Do no
 
 1. Land encoder extract + tests (PR 1) — no user-visible change.
 2. Land shm + probe (PR 2) behind no flag; automatic.
-3. Manual check: Kitty/Ghostty local (`t=s` in a raw dump of stdout should show a short APC with `t=s`); `blackcat img.png | cat` still `t=d`; `TERM=xterm-256color` adds no 100 ms; `blackcat img.png` over SSH still displays via `t=d` after ≤100 ms remaining wait (often overlapped).
+3. Manual check: Kitty/Ghostty local (`t=s` in a raw dump of stdout should show a short APC with `t=s`); `blackcat img.png | cat` still `t=d`; xterm/Terminal.app display via `t=d` after DA1 (not a full 100 ms hang); `blackcat img.png` over SSH still displays via `t=d` after ≤100 ms remaining wait (often overlapped).
 4. Rollback: revert PR 2. Direct path remains.
 
 No feature flag. Release as a normal version bump when merging to master (`build.zig.zon` `.version`, annotated tag) — not part of this design’s implementation work.
@@ -998,7 +975,7 @@ No feature flag. Release as a normal version bump when merging to master (`build
 
 All protocol tests live in `src/image.zig`. **Do not** call `probeShm` / `startProbe` / `renderImage`’s tty gate from unit tests: those would `tcsetattr` the developer’s `/dev/tty`, wait for replies to a query that went into an `Allocating` writer, and poison `shm_support`.
 
-Export and test: `writeDirectApc`, `writeShmApc`, `feedProbe` / `ProbeParser`, `formatShmName`, `createShm`, `termMayHaveKittyGraphics`, `transmitDirect`, `transmitShm`.
+Export and test: `writeDirectApc`, `writeShmApc`, `feedProbe` / `ProbeParser`, `formatShmName`, `createShm`, `transmitDirect`, `transmitShm`.
 
 Call `resetShmSupportForTest()` at the start of any test that can touch `shm_support` or `test_force_shm_create_error`.
 
@@ -1024,8 +1001,7 @@ Use `std.Io.Writer.Allocating` as the sink.
    - `mmap` + compare bytes.
    - `unlink` in `defer` (no terminal will).
    - `return error.SkipZigTest` if `/dev/shm` missing or `shm_open` fails.
-9. **`termMayHaveKittyGraphics`** — `xterm-kitty` / `xterm-ghostty` / `wezterm-direct` true; `xterm-256color` / `tmux-256color` / `dumb` / `""` false.
-10. **Name collision retry** — optional: pre-create the would-be name, call `createShm`, expect a different name, cleanup both.
+9. **Name collision retry** — optional: pre-create the would-be name, call `createShm`, expect a different name, cleanup both.
 
 PR 1: `test { _ = image; }` in `main.zig`.
 
@@ -1037,10 +1013,10 @@ Do **not** add a `cat_compat` image test; GNU cat has no graphics protocol.
 
 | Risk | Severity | Mitigation |
 | --- | --- | --- |
-| 100 ms timeout false-negative on a busy/slow host | Medium | Image still displays via `t=d`. Cache poisons the rest of this process. Do not raise to 10 s. Overlap + TERM-gate cut the common-case cost to 0. |
-| Probe timeout **false-negative over SSH** | Low (desired) | shm cannot work remotely; fallback is the feature. `TERM=xterm-kitty` still probes. |
-| 100 ms on Kitty-TERM over SSH | Low | Upper bound; often overlapped by decode. |
-| WezTerm/iTerm2 with `TERM=xterm-256color` skip shm | Low | Still `t=d`. Document. |
+| 100 ms timeout false-negative on a busy/slow host | Medium | Image still displays via `t=d`. Cache poisons the rest of this process. Do not raise to 10 s. Overlap + DA1 cut the common-case wait. |
+| Probe timeout **false-negative over SSH** | Low (desired) | shm cannot work remotely; fallback is the feature. |
+| 100 ms on SSH when DA1 is delayed | Low | Upper bound; often overlapped by decode. |
+| WezTerm/iTerm2 with `TERM=xterm-256color` | Low | Probe decides. If they implement `t=s`, we use it. |
 | Leftover shm objects (kill −9, panic after create) | Medium | `O_EXCL` names with pid; 0600; dummy is 3 bytes. |
 | Darwin name too long | Low | 19-byte names; test. |
 | Query APC mixed into image data | Low | `a=q` is not displayed; it is flushed **before** `"\n     "` and image APCs. Dummy is not the display payload. |
@@ -1051,7 +1027,7 @@ Do **not** add a `cat_compat` image test; GNU cat has no graphics protocol.
 | Terminals with `t=d` but not `t=s` | Medium | Probe: error or DA1-without-OK → stream. |
 | Ghostty shm requires libc **in the terminal** | Low | Ghostty the emulator links libc. Our Linux client uses `/dev/shm`; Ghostty `shm_open`s the same object. |
 | WezTerm macOS shm historically used `read()` not `mmap` ([issue #7631](https://github.com/wezterm/wezterm/issues/7631)) | Medium | Probe: if WezTerm errors, we stream. We still mmap on **our** side. |
-| tmux swallows replies | Low | Timeout or TERM skip → `t=d`. Passthrough-OK uses shm (allowed). |
+| tmux swallows replies | Low | Timeout or DA1-without-OK → `t=d`. Passthrough-OK uses shm (allowed). |
 | Writing query to stdout while stdout is a tty but not the controlling tty | Low | Timeout → stream. |
 | `ioctl(TIOCGWINSZ)` still on fd 1 | N/A | Unchanged. |
 | Cache poisoned by a flaky first probe | Medium | Accept. No retry, no env override. |
@@ -1063,16 +1039,14 @@ Do **not** add a `cat_compat` image test; GNU cat has no graphics protocol.
 
 | Terminal | Kitty protocol | `t=s` | Effect for blackcat |
 | --- | --- | --- | --- |
-| Kitty (`TERM=xterm-kitty`) | Yes | Yes | Probe (overlapped) → shm |
-| Ghostty (`xterm-ghostty`) | Yes | Yes (`graphics_image.zig` `readSharedMemory`) | Probe → shm |
-| WezTerm (`TERM=wezterm`) | Yes | Yes (PR #1810); macOS read-vs-mmap bugs possible | Probe decides |
-| WezTerm (`TERM=xterm-256color`) | Yes | Yes | **Skip probe**, `t=d` immediately |
-| Konsole / iTerm2 (generic TERM) | Partial | Unknown | Skip probe, `t=d` |
-| Warp / st patch / xterm.js | Partial | Unknown | Skip unless TERM allowlisted |
-| tmux (`tmux-256color`) | Pass-through dependent | No replies usually | Skip probe, `t=d` |
-| tmux + `TERM=xterm-kitty` + passthrough | Maybe | Maybe | Probe; `OK` → shm (allowed) |
-| SSH to remote host from Kitty | `t=d` only for shm | Local shm invisible | Probe, timeout/error → `t=d` |
-| Terminal.app / xterm / linux console | No | No | Skip probe, `t=d` (no 100 ms) |
+| Kitty | Yes | Yes | Probe (overlapped) → shm |
+| Ghostty | Yes | Yes (`graphics_image.zig` `readSharedMemory`) | Probe → shm |
+| WezTerm | Yes | Yes (PR #1810); macOS read-vs-mmap bugs possible | Probe decides |
+| Konsole / iTerm2 | Partial | Unknown | Probe; OK → shm, else `t=d` |
+| Warp / st patch / xterm.js | Partial | Unknown | Probe decides |
+| tmux | Pass-through dependent | No replies usually | Probe; timeout/DA1 → `t=d`; passthrough-OK → shm |
+| SSH to remote host | `t=d` only for shm | Local shm invisible | Probe, timeout/error → `t=d` |
+| Terminal.app / xterm / linux console | No | No | Probe; DA1-without-OK → `t=d` |
 
 ---
 
@@ -1083,7 +1057,6 @@ None that block implementation. Settled in **Key Decisions**. Optional follow-up
 - Add `t=t` if a popular terminal answers OK for file but not shm.
 - Drop `o=z` on the shm path after profiling.
 - tmux passthrough wrapping + Unicode placeholders.
-- Widen the TERM allowlist if WezTerm-default users want shm without setting `TERM`.
 
 ---
 
@@ -1097,7 +1070,7 @@ None that block implementation. Settled in **Key Decisions**. Optional follow-up
 - POSIX `shm_open`: https://pubs.opengroup.org/onlinepubs/9699919799/functions/shm_open.html
 - Linux shm implementation: `open("/dev/shm/name")` (man 3 shm_open)
 - Darwin `shm_open(2)` / `PSHMNAMLEN` 31
-- Zig 0.16 std (verified under `/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/std`): `posix.mmap`/`munmap`/`openat`/`poll`/`read`/`tcgetattr`/`tcsetattr`/`sigaction`/`raise`/`V.MIN`/`V.TIME`, `Io.File.isTty`/`setLength`/`close`, `Io.Dir.openFileAbsolute`/`deleteFileAbsolute`, `Io.random`, `Io.Clock.awake` / `Clock.Timestamp.fromNow`, `c.shm_open`/`shm_unlink`/`unlink`, `os.linux.unlink`, `process.Environ.Map.get`
+- Zig 0.16 std (verified under `/opt/homebrew/Cellar/zig/0.16.0_1/lib/zig/std`): `posix.mmap`/`munmap`/`openat`/`poll`/`read`/`tcgetattr`/`tcsetattr`/`sigaction`/`raise`/`V.MIN`/`V.TIME`, `Io.File.isTty`/`setLength`/`close`, `Io.Dir.openFileAbsolute`/`deleteFileAbsolute`, `Io.random`, `Io.Clock.awake` / `Clock.Timestamp.fromNow`, `c.shm_open`/`shm_unlink`/`unlink`, `os.linux.unlink`
 - Current encoder: `src/image.zig` `renderImage`
 - CLI wiring: `src/main.zig` `catFile`
 - Release link: `build.zig` (linux musl, no `linkLibC`)
@@ -1108,7 +1081,7 @@ None that block implementation. Settled in **Key Decisions**. Optional follow-up
 
 1. **Probe-once `a=q` + DA1, 100 ms remaining-time deadline, process cache.** Real query is the only correct SSH/remote signal. Do **not** use local-fail-only. Cache so `blackcat *.png` does not probe per file. If the probe cannot run, treat as stream. A flaky first probe poisons the rest of the process; accept, no retry.
 
-2. **TERM allowlist gates the probe.** Probe only for `xterm-kitty`, `xterm-ghostty`, `ghostty`, `wezterm`/`wezterm-*`, `kitty`/`kitty-*`. Everyone else gets immediate `t=d` (no 100 ms). SSH from Kitty still probes.
+2. **No `TERM` allowlist.** Probe is the only runtime signal. Non-graphics terminals answer DA1 without `OK` and fall back to `t=d`. Guessing from `TERM` would miss terminals that keep `xterm-256color`.
 
 3. **Overlap probe with decode.** `startProbe` (dummy + query + DA1 flush) before zigimg; `finishProbe` (remaining-time `poll`) after zlib. 100 ms is an upper bound on blocking wait. **`startProbe` is transactional:** dummy create before `tcsetattr`/`sigaction`; after the first mutation, `errdefer` restores handlers **before** clearing globals (LIFO: declare `clearProbeGlobals` first). Handler names live in process-lifetime sentinel arrays, not `ShmObject.name_buf`. `catch null` cannot leave a raw tty.
 
@@ -1148,8 +1121,8 @@ None that block implementation. Settled in **Key Decisions**. Optional follow-up
 ### PR 2 — POSIX shm transmit, query probe, and `t=d` fallback
 
 - **PR title:** Add POSIX shm (`t=s`) Kitty transmission with query probe and direct fallback
-- **Files / components:** `src/image.zig`, `src/main.zig` (`TERM` argument to `renderImage`)
+- **Files / components:** `src/image.zig` (PR 1 already added `test { _ = image; }` in `src/main.zig`)
 - **Dependencies:** PR 1
-- **Description:** Implement the **Probe I/O algorithm**, including transactional `startProbe` (`errdefer` restore after first mutation; dummy create before `tcsetattr`; declare `clearProbeGlobals` before `restoreProbeHandlers` so LIFO restores `Sigaction`s first; copy dummy name/path into process-lifetime sentinel arrays — handler Z pointers never alias a `ShmObject`). Deadline loop uses `durationFromNow` and `@min(rem_ms, @as(i64, shm_probe_timeout_ms))`. SIGINT/SIGTERM restore then `_ = posix.raise(sig) catch {}`. Dummy `{1,2,3}` via `createShm(io, data)` (memcpy inside). TERM allowlist, overlap with decode. Linux `/dev/shm` `openat` + `deleteFileAbsolute`; Darwin/FreeBSD `std.c.shm_open`. `writeShmApc` always `S=`. `transmitShm` `.sent` vs `.local_fail` vs write error. `ProbeParser` ignores unmatched `i=`. `renderImage` order: optional `startProbe` (`catch null` is safe) → decode/zlib → `finishProbe` → `"\n     "` → shm or direct → `"\n\n"` flush. Tests: name limits, shm APC framing, parser cases including unmatched APC, `createShm(io, &.{})` InvalidSize, injected create-fail → `.local_fail` → direct, TERM allowlist, optional local shm round-trip with `SkipZigTest`. `resetShmSupportForTest` in test setup. **No** unit test calls `startProbe`. No CLI flags. Manual checks: Kitty/Ghostty local `t=s`; pipe stays `t=d`; `TERM=xterm-256color` adds no wait; SSH displays via `t=d`.
+- **Description:** Implement the **Probe I/O algorithm**, including transactional `startProbe` (`errdefer` restore after first mutation; dummy create before `tcsetattr`; declare `clearProbeGlobals` before `restoreProbeHandlers` so LIFO restores `Sigaction`s first; copy dummy name/path into process-lifetime sentinel arrays — handler Z pointers never alias a `ShmObject`). Deadline loop uses `durationFromNow` and `@min(rem_ms, @as(i64, shm_probe_timeout_ms))`. SIGINT/SIGTERM restore then `_ = posix.raise(sig) catch {}`. Dummy `{1,2,3}` via `createShm(io, data)` (memcpy inside). No `TERM` allowlist; overlap with decode. Linux `/dev/shm` `openat` + `deleteFileAbsolute`; Darwin/FreeBSD `std.c.shm_open`. `writeShmApc` always `S=`. `transmitShm` `.sent` vs `.local_fail` vs write error. `ProbeParser` ignores unmatched `i=`. `renderImage` order: optional `startProbe` (`catch null` is safe) → decode/zlib → `finishProbe` → `"\n     "` → shm or direct → `"\n\n"` flush. Tests: name limits, shm APC framing, parser cases including unmatched APC, `createShm(io, &.{})` InvalidSize, injected create-fail → `.local_fail` → direct, optional local shm round-trip with `SkipZigTest`. `resetShmSupportForTest` in test setup. **No** unit test calls `startProbe`. No CLI flags. Manual checks: Kitty/Ghostty local `t=s`; pipe stays `t=d`; xterm/Terminal.app DA1 → `t=d`; SSH displays via `t=d`.
 
 Two PRs is enough. An optional split of PR 2 into “shm create + `writeShmApc` + round-trip” then “probe + `renderImage` branch” is not required now that the probe algorithm is specified.
