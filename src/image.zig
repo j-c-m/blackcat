@@ -136,19 +136,6 @@ const ShmObject = struct {
     }
 };
 
-const ProbeSession = struct {
-    tty: std.Io.File,
-    saved: std.posix.termios,
-    dummy: ShmObject,
-    deadline: std.Io.Clock.Timestamp,
-    parser: ProbeParser,
-    finished: bool = false,
-
-    fn finish(self: *ProbeSession, io: std.Io) void {
-        finishProbe(self, io);
-    }
-};
-
 pub fn isImageFile(head_buf: []const u8) !bool {
     _ = zigimg.Image.detectFormatFromMemory(head_buf[0..]) catch return false;
     return true;
@@ -156,12 +143,9 @@ pub fn isImageFile(head_buf: []const u8) !bool {
 
 pub fn renderImage(alloc: std.mem.Allocator, io: std.Io, file: *std.Io.File, writer: *std.Io.Writer) !void {
     const stdout_tty = std.Io.File.stdout().isTty(io) catch false;
-    var probe: ?ProbeSession = null;
-    defer if (probe) |*p| p.finish(io);
-
     const eligible = stdout_tty and shmAvailable();
     if (eligible and shm_support == .unknown) {
-        probe = startProbe(io, writer) catch null;
+        probeShmSupport(io);
     }
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -227,11 +211,6 @@ pub fn renderImage(alloc: std.mem.Allocator, io: std.Io, file: *std.Io.File, wri
 
         const ai = compressed.toArrayList();
         byte_data = ai;
-    }
-
-    if (probe) |*p| {
-        p.finish(io);
-        probe = null;
     }
 
     try writer.print("\n     ", .{});
@@ -391,13 +370,13 @@ fn writeDirectApc(
     while (start < data.len) {
         const end = @min(start + kitty_chunk_size, data.len);
         if (start == 0) {
-            try writer.print("\x1B_Gf=32,o=z,s={d},v={d},a=T,m=1;{s}\x1B\\", .{ width, height, data[start..end] });
+            try writer.print("\x1B_Gf=32,o=z,s={d},v={d},a=T,q=2,m=1;{s}\x1B\\", .{ width, height, data[start..end] });
         } else {
-            try writer.print("\x1B_Gm=1;{s}\x1B\\", .{data[start..end]});
+            try writer.print("\x1B_Gq=2,m=1;{s}\x1B\\", .{data[start..end]});
         }
         start = end;
     }
-    try writer.print("\x1B_Gm=0;\x1B\\", .{});
+    try writer.print("\x1B_Gq=2,m=0;\x1B\\", .{});
 }
 
 fn transmitDirect(
@@ -420,7 +399,7 @@ fn writeShmApc(
     var b64_buf: [64]u8 = undefined;
     const b64 = encodeNameB64(posix_name, &b64_buf);
     try writer.print(
-        "\x1B_Gf=32,o=z,s={d},v={d},a=T,t=s,S={d};{s}\x1B\\",
+        "\x1B_Gf=32,o=z,s={d},v={d},a=T,q=2,t=s,S={d};{s}\x1B\\",
         .{ width, height, data_size, b64 },
     );
 }
@@ -526,103 +505,74 @@ fn installProbeHandlers(tty_fd: std.posix.fd_t, saved: std.posix.termios, posix_
     probe_handlers_live = true;
 }
 
-fn startProbe(io: std.Io, writer: *std.Io.Writer) !ProbeSession {
-    const tty = std.Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_only }) catch {
-        shm_support = .no;
-        return error.NoControllingTty;
-    };
-    errdefer shm_support = .no;
-    errdefer tty.close(io);
+fn feedTtyRead(fd: std.posix.fd_t, parser: *ProbeParser) bool {
+    var tmp: [256]u8 = undefined;
+    const n = std.posix.read(fd, &tmp) catch return false;
+    if (n == 0) return false;
+    _ = parser.feed(tmp[0..n]);
+    return true;
+}
 
-    const saved = std.posix.tcgetattr(tty.handle) catch {
-        shm_support = .no;
-        return error.NotATerminal;
-    };
+/// icat DetectSupport: query on the controlling tty, wait for DA1, restore with TCSAFLUSH.
+fn probeShmSupport(io: std.Io) void {
+    shm_support = .no;
+    if (!shmAvailable()) return;
 
-    var dummy = createShm(io, &shm_dummy_rgb) catch |err| {
-        shm_support = .no;
-        return err;
-    };
+    var dummy = createShm(io, &shm_dummy_rgb) catch return;
     dummy.unmap();
     dummy.closeFd(io);
-    errdefer dummy.unlink(io);
+    defer if (shm_support != .yes) dummy.unlink(io);
 
+    const tty = std.Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_write }) catch return;
+    defer tty.close(io);
+
+    const saved = std.posix.tcgetattr(tty.handle) catch return;
     var term = saved;
     term.lflag.ICANON = false;
     term.lflag.ECHO = false;
     term.cc[@intFromEnum(std.posix.V.MIN)] = 0;
     term.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-    try std.posix.tcsetattr(tty.handle, .NOW, term);
-    errdefer std.posix.tcsetattr(tty.handle, .NOW, saved) catch {};
+    std.posix.tcsetattr(tty.handle, .NOW, term) catch return;
+    defer std.posix.tcsetattr(tty.handle, .FLUSH, saved) catch {};
 
-    errdefer clearProbeGlobals();
-    var handlers_installed = false;
+    defer clearProbeGlobals();
     installProbeHandlers(tty.handle, saved, dummy.posixName());
-    handlers_installed = true;
-    errdefer if (handlers_installed) restoreProbeHandlers();
+    defer restoreProbeHandlers();
 
     const image_id = randomImageId(io);
     var b64_buf: [64]u8 = undefined;
     const b64 = encodeNameB64(dummy.posixName(), &b64_buf);
-    try writer.print(
-        "\x1B_Gi={d},s=1,v=1,a=q,t=s,f=24,S=3;{s}\x1B\\\x1B[c",
+    var msg_buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &msg_buf,
+        "\x1b_Gi={d},s=1,v=1,a=q,t=s,f=24,S=3;{s}\x1b\\\x1b[c",
         .{ image_id, b64 },
-    );
-    try writer.flush();
+    ) catch return;
+    tty.writeStreamingAll(io, msg) catch return;
 
+    var parser = ProbeParser{ .want_id = image_id };
     const timeout: std.Io.Clock.Duration = .{
         .raw = .fromMilliseconds(shm_probe_timeout_ms),
         .clock = .awake,
     };
     const deadline = std.Io.Clock.Timestamp.fromNow(io, timeout);
 
-    return .{
-        .tty = tty,
-        .saved = saved,
-        .dummy = dummy,
-        .deadline = deadline,
-        .parser = .{ .want_id = image_id },
-    };
-}
-
-fn finishProbe(session: *ProbeSession, io: std.Io) void {
-    if (session.finished) return;
-    session.finished = true;
-
-    if (!session.parser.done()) {
+    while (!parser.saw_da1) {
+        const rem_ms = deadline.durationFromNow(io).raw.toMilliseconds();
+        if (rem_ms <= 0) break;
+        const poll_ms: i32 = @intCast(@min(rem_ms, @as(i64, shm_probe_timeout_ms)));
         var fds = [_]std.posix.pollfd{.{
-            .fd = session.tty.handle,
+            .fd = tty.handle,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
-        while (!session.parser.done()) {
-            const remaining = session.deadline.durationFromNow(io);
-            const rem_ms = remaining.raw.toMilliseconds();
-            const poll_ms: i32 = if (rem_ms <= 0) 0 else @intCast(@min(rem_ms, @as(i64, shm_probe_timeout_ms)));
-            _ = std.posix.poll(&fds, poll_ms) catch break;
-            if (poll_ms == 0 and (fds[0].revents & std.posix.POLL.IN) == 0) break;
-            if ((fds[0].revents & std.posix.POLL.IN) == 0) {
-                if (poll_ms == 0) break;
-                continue;
-            }
-            var tmp: [256]u8 = undefined;
-            const n = std.posix.read(session.tty.handle, &tmp) catch |err| switch (err) {
-                error.WouldBlock => continue,
-                else => break,
-            };
-            if (n == 0) break;
-            _ = session.parser.feed(tmp[0..n]);
-        }
+        _ = std.posix.poll(&fds, poll_ms) catch break;
+        if (!feedTtyRead(tty.handle, &parser)) continue;
+        while (feedTtyRead(tty.handle, &parser)) {}
     }
+    while (feedTtyRead(tty.handle, &parser)) {}
 
-    restoreProbeHandlers();
-    std.posix.tcsetattr(session.tty.handle, .NOW, session.saved) catch {};
-
-    const ok = session.parser.saw_ok;
-    shm_support = if (ok) .yes else .no;
-    if (!ok) session.dummy.unlink(io);
-    session.tty.close(io);
-    clearProbeGlobals();
+    if (parser.saw_ok) shm_support = .yes;
 }
 
 fn appendBuf(buf: *[1024]u8, len: *usize, chunk: []const u8) void {
@@ -694,10 +644,10 @@ fn parseApc(bytes: []const u8) ?ApcParse {
 }
 
 fn parseDa1(bytes: []const u8) ?usize {
-    if (bytes.len < 3) return null;
-    if (bytes[0] != 0x1b or bytes[1] != '[') return null;
-    var i: usize = 2;
-    if (i < bytes.len and bytes[i] == '?') i += 1;
+    // icat: CSI payload starts with '?' and ends with 'c' (e.g. ?62;22;52c)
+    if (bytes.len < 4) return null;
+    if (bytes[0] != 0x1b or bytes[1] != '[' or bytes[2] != '?') return null;
+    var i: usize = 3;
     while (i < bytes.len) : (i += 1) {
         const c = bytes[i];
         if (c == 'c') return i + 1;
@@ -803,8 +753,8 @@ test "writeDirectApc framing" {
     const payload = "abc";
     try writeDirectApc(std.testing.allocator, &aw.writer, payload, 2, 3);
     const out = aw.written();
-    try std.testing.expect(std.mem.startsWith(u8, out, "\x1b_Gf=32,o=z,s=2,v=3,a=T,m=1;"));
-    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b_Gm=0;\x1b\\"));
+    try std.testing.expect(std.mem.startsWith(u8, out, "\x1b_Gf=32,o=z,s=2,v=3,a=T,q=2,m=1;"));
+    try std.testing.expect(std.mem.endsWith(u8, out, "\x1b_Gq=2,m=0;\x1b\\"));
     try std.testing.expect(std.mem.indexOf(u8, out, "t=s") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b_Gm=1;") == null);
 }
@@ -822,7 +772,7 @@ test "writeDirectApc chunks at 4096" {
     const raw = [_]u8{0xaa} ** 4000;
     try writeDirectApc(std.testing.allocator, &aw.writer, &raw, 10, 10);
     const out = aw.written();
-    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b_Gm=1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b_Gq=2,m=1;") != null);
     var it = std.mem.splitSequence(u8, out, "\x1b_");
     _ = it.next();
     while (it.next()) |frame| {
@@ -881,6 +831,13 @@ test "probe parser ignores unmatched i=" {
 test "probe parser BEL terminator" {
     var p = ProbeParser{ .want_id = 4 };
     try std.testing.expectEqual(ProbeParse.ok, p.feed("\x1b_Gi=4;OK\x07"));
+}
+
+test "probe parser kitty OK plus DA1" {
+    var p = ProbeParser{ .want_id = 3073211871 };
+    _ = p.feed("\x1b_Gi=3073211871;OK\x1b\\\x1b[?62;22;52c");
+    try std.testing.expect(p.saw_ok);
+    try std.testing.expect(p.saw_da1);
 }
 
 test "createShm empty is InvalidSize" {
