@@ -12,16 +12,6 @@ const ShmSupport = enum { unknown, yes, no };
 var shm_support: ShmSupport = .unknown;
 var test_force_shm_create_error: ?anyerror = null;
 
-var probe_tty_fd: std.posix.fd_t = -1;
-var probe_saved_termios: ?std.posix.termios = null;
-var probe_dummy_name_buf: [shm_name_max + 1:0]u8 = [_:0]u8{0} ** (shm_name_max + 1);
-var probe_dummy_linux_path_buf: [64:0]u8 = [_:0]u8{0} ** 64;
-var probe_dummy_name_z: ?[*:0]const u8 = null;
-var probe_dummy_linux_path_z: ?[*:0]const u8 = null;
-var probe_old_int: std.posix.Sigaction = undefined;
-var probe_old_term: std.posix.Sigaction = undefined;
-var probe_handlers_live: bool = false;
-
 const Winsize = extern struct {
     ws_row: u16,
     ws_col: u16,
@@ -40,10 +30,6 @@ const ProbeParser = struct {
     saw_ok: bool = false,
     saw_fail: bool = false,
     saw_da1: bool = false,
-
-    fn done(self: ProbeParser) bool {
-        return self.saw_ok or self.saw_fail or self.saw_da1;
-    }
 
     fn result(self: ProbeParser) ProbeParse {
         if (self.saw_ok) return .ok;
@@ -219,10 +205,10 @@ pub fn renderImage(alloc: std.mem.Allocator, io: std.Io, file: *std.Io.File, wri
     if (eligible and shm_support == .yes) {
         switch (try transmitShm(io, writer, byte_data.items, img.width, img.height)) {
             .sent => {},
-            .local_fail => try transmitDirect(allocator, writer, byte_data.items, img.width, img.height),
+            .local_fail => try writeDirectApc(allocator, writer, byte_data.items, img.width, img.height),
         }
     } else {
-        try transmitDirect(allocator, writer, byte_data.items, img.width, img.height);
+        try writeDirectApc(allocator, writer, byte_data.items, img.width, img.height);
     }
     try writer.print("\n\n", .{});
     try writer.flush();
@@ -241,8 +227,7 @@ fn resetShmSupportForTest() void {
 }
 
 fn currentPid() u32 {
-    const raw = std.posix.system.getpid();
-    return std.math.cast(u32, raw) orelse @truncate(@as(u64, @bitCast(@as(i64, raw))));
+    return @intCast(std.posix.system.getpid());
 }
 
 fn formatShmName(buf: *[shm_name_max + 1:0]u8, pid: u32, rand: u32) [:0]u8 {
@@ -379,16 +364,6 @@ fn writeDirectApc(
     try writer.print("\x1B_Gq=2,m=0;\x1B\\", .{});
 }
 
-fn transmitDirect(
-    allocator: std.mem.Allocator,
-    writer: *std.Io.Writer,
-    compressed: []const u8,
-    width: usize,
-    height: usize,
-) !void {
-    try writeDirectApc(allocator, writer, compressed, width, height);
-}
-
 fn writeShmApc(
     writer: *std.Io.Writer,
     posix_name: []const u8,
@@ -430,81 +405,6 @@ fn randomImageId(io: std.Io) u32 {
     }
 }
 
-fn clearProbeGlobals() void {
-    probe_tty_fd = -1;
-    probe_saved_termios = null;
-    probe_dummy_name_buf = [_:0]u8{0} ** (shm_name_max + 1);
-    probe_dummy_linux_path_buf = [_:0]u8{0} ** 64;
-    probe_dummy_name_z = null;
-    probe_dummy_linux_path_z = null;
-    probe_handlers_live = false;
-}
-
-fn restoreProbeHandlers() void {
-    if (!probe_handlers_live) return;
-    std.posix.sigaction(.INT, &probe_old_int, null);
-    std.posix.sigaction(.TERM, &probe_old_term, null);
-    probe_handlers_live = false;
-}
-
-fn unlinkDummyFromHandler() void {
-    switch (builtin.os.tag) {
-        .linux => {
-            if (probe_dummy_linux_path_z) |p| {
-                _ = std.os.linux.unlink(p);
-            }
-        },
-        .macos, .freebsd => {
-            if (probe_dummy_name_z) |p| {
-                _ = std.c.shm_unlink(p);
-            }
-        },
-        else => {},
-    }
-}
-
-fn probeSignalHandler(sig: std.posix.SIG) callconv(.c) void {
-    if (probe_saved_termios) |saved| {
-        if (probe_tty_fd >= 0) {
-            std.posix.tcsetattr(probe_tty_fd, .NOW, saved) catch {};
-        }
-    }
-    unlinkDummyFromHandler();
-    if (sig == .INT) {
-        std.posix.sigaction(.INT, &probe_old_int, null);
-    } else if (sig == .TERM) {
-        std.posix.sigaction(.TERM, &probe_old_term, null);
-    }
-    probe_handlers_live = false;
-    _ = std.posix.raise(sig) catch {};
-}
-
-fn installProbeHandlers(tty_fd: std.posix.fd_t, saved: std.posix.termios, posix_name: []const u8) void {
-    @memset(probe_dummy_name_buf[0..], 0);
-    const n = @min(posix_name.len, probe_dummy_name_buf.len - 1);
-    @memcpy(probe_dummy_name_buf[0..n], posix_name[0..n]);
-    probe_dummy_name_buf[n] = 0;
-    probe_dummy_name_z = &probe_dummy_name_buf;
-
-    if (builtin.os.tag == .linux) {
-        @memset(probe_dummy_linux_path_buf[0..], 0);
-        _ = std.fmt.bufPrintZ(&probe_dummy_linux_path_buf, "/dev/shm/{s}", .{posix_name[1..]}) catch {};
-        probe_dummy_linux_path_z = &probe_dummy_linux_path_buf;
-    }
-
-    probe_tty_fd = tty_fd;
-    probe_saved_termios = saved;
-
-    const act = std.posix.Sigaction{
-        .handler = .{ .handler = probeSignalHandler },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(.INT, &act, &probe_old_int);
-    std.posix.sigaction(.TERM, &act, &probe_old_term);
-    probe_handlers_live = true;
-}
-
 fn feedTtyRead(fd: std.posix.fd_t, parser: *ProbeParser) bool {
     var tmp: [256]u8 = undefined;
     const n = std.posix.read(fd, &tmp) catch return false;
@@ -534,10 +434,6 @@ fn probeShmSupport(io: std.Io) void {
     term.cc[@intFromEnum(std.posix.V.TIME)] = 0;
     std.posix.tcsetattr(tty.handle, .NOW, term) catch return;
     defer std.posix.tcsetattr(tty.handle, .FLUSH, saved) catch {};
-
-    defer clearProbeGlobals();
-    installProbeHandlers(tty.handle, saved, dummy.posixName());
-    defer restoreProbeHandlers();
 
     const image_id = randomImageId(io);
     var b64_buf: [64]u8 = undefined;
@@ -855,7 +751,7 @@ test "create-fail returns local_fail then direct" {
 
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
-    try transmitDirect(std.testing.allocator, &aw.writer, "zlib", 1, 1);
+    try writeDirectApc(std.testing.allocator, &aw.writer, "zlib", 1, 1);
     const out = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "t=s") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "a=T") != null);
