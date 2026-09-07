@@ -126,6 +126,7 @@ fn build_exe(
         .root_module = exe_mod,
         //.strip = strip,
     });
+    exe.use_llvm = true;
     if (pie) |value| exe.pie = value;
 
     const build_options = b.addOptions();
@@ -152,6 +153,7 @@ fn build_exe(
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
     });
+    exe_unit_tests.use_llvm = true;
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     test_step.dependOn(&run_exe_unit_tests.step);
 
