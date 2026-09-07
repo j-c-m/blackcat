@@ -176,42 +176,41 @@ pub fn renderImage(alloc: std.mem.Allocator, io: std.Io, file: *std.Io.File, wri
     }
 
     const raw_bytes = std.mem.sliceAsBytes(img.pixels.rgba32);
-    var byte_data = try std.ArrayList(u8).initCapacity(allocator, raw_bytes.len);
-    defer byte_data.deinit(allocator);
-    try byte_data.appendSlice(allocator, raw_bytes);
-
-    {
-        var compressed = try std.Io.Writer.Allocating.initCapacity(allocator, byte_data.items.len);
-        defer compressed.deinit();
-
-        var deflate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
-        var compress = try std.compress.flate.Compress.init(
-            &compressed.writer,
-            &deflate_buffer,
-            .zlib,
-            .fastest,
-        );
-
-        try compress.writer.writeAll(byte_data.items);
-        try compress.finish();
-
-        const ai = compressed.toArrayList();
-        byte_data = ai;
-    }
 
     try writer.print("\n     ", .{});
-    if (byte_data.items.len == 0) return;
+    if (raw_bytes.len == 0) return;
 
+    var used_shm = false;
     if (eligible and shm_support == .yes) {
-        switch (try transmitShm(io, writer, byte_data.items, img.width, img.height)) {
-            .sent => {},
-            .local_fail => try writeDirectApc(allocator, writer, byte_data.items, img.width, img.height),
-        }
-    } else {
-        try writeDirectApc(allocator, writer, byte_data.items, img.width, img.height);
+        used_shm = switch (try transmitShm(io, writer, raw_bytes, img.width, img.height)) {
+            .sent => true,
+            .local_fail => false,
+        };
+    }
+    if (!used_shm) {
+        var compressed = try compressZlib(allocator, raw_bytes);
+        defer compressed.deinit(allocator);
+        try writeDirectApc(allocator, writer, compressed.items, img.width, img.height);
     }
     try writer.print("\n\n", .{});
     try writer.flush();
+}
+
+fn compressZlib(allocator: std.mem.Allocator, raw: []const u8) !std.ArrayList(u8) {
+    var compressed = try std.Io.Writer.Allocating.initCapacity(allocator, raw.len);
+    errdefer compressed.deinit();
+
+    var deflate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+    var compress = try std.compress.flate.Compress.init(
+        &compressed.writer,
+        &deflate_buffer,
+        .zlib,
+        .fastest,
+    );
+
+    try compress.writer.writeAll(raw);
+    try compress.finish();
+    return compressed.toArrayList();
 }
 
 fn shmAvailable() bool {
@@ -374,7 +373,7 @@ fn writeShmApc(
     var b64_buf: [64]u8 = undefined;
     const b64 = encodeNameB64(posix_name, &b64_buf);
     try writer.print(
-        "\x1B_Gf=32,o=z,s={d},v={d},a=T,q=2,t=s,S={d};{s}\x1B\\",
+        "\x1B_Gf=32,s={d},v={d},a=T,q=2,t=s,S={d};{s}\x1B\\",
         .{ width, height, data_size, b64 },
     );
 }
@@ -382,16 +381,16 @@ fn writeShmApc(
 fn transmitShm(
     io: std.Io,
     writer: *std.Io.Writer,
-    compressed: []const u8,
+    pixels: []const u8,
     width: usize,
     height: usize,
 ) !TransmitShm {
-    var obj = createShm(io, compressed) catch return .local_fail;
+    var obj = createShm(io, pixels) catch return .local_fail;
     obj.unmap();
     obj.closeFd(io);
     errdefer obj.unlink(io);
 
-    try writeShmApc(writer, obj.posixName(), compressed.len, width, height);
+    try writeShmApc(writer, obj.posixName(), pixels.len, width, height);
     try writer.flush();
     return .sent;
 }
@@ -689,7 +688,7 @@ test "writeShmApc framing" {
     try writeShmApc(&aw.writer, name, 12, 4, 5);
     const out = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "t=s") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "o=z") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "o=z") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "S=12") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "m=") == null);
     const decoded = try decodeB64Payload(out);
