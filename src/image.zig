@@ -793,3 +793,25 @@ test "local shm round-trip" {
     defer std.posix.munmap(map);
     try std.testing.expectEqualStrings(payload, map[0..payload.len]);
 }
+
+test "jpeg 4:2:0 restart interval" {
+    const bytes = @embedFile("fixtures/restart-420.jpg");
+    var img = try zigimg.Image.fromMemory(std.testing.allocator, bytes);
+    defer img.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 32), img.width);
+    try std.testing.expectEqual(@as(usize, 32), img.height);
+    try img.convert(std.testing.allocator, .rgba32);
+
+    const px = img.pixels.rgba32;
+    try expectRgb(px[4 * img.width + 4], 254, 0, 0);
+    try expectRgb(px[4 * img.width + 20], 0, 255, 1);
+    try expectRgb(px[20 * img.width + 4], 0, 0, 254);
+    try expectRgb(px[20 * img.width + 20], 255, 255, 255);
+}
+
+fn expectRgb(pixel: zigimg.color.Rgba32, r: u8, g: u8, b: u8) !void {
+    try std.testing.expectEqual(r, pixel.r);
+    try std.testing.expectEqual(g, pixel.g);
+    try std.testing.expectEqual(b, pixel.b);
+    try std.testing.expectEqual(@as(u8, 255), pixel.a);
+}
