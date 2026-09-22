@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const zigimg = @import("zigimg");
 
 const kitty_chunk_size = 4096;
+const animation_rgba_cap: usize = 320 << 20;
+const zero_delay_gap_ms: u32 = 100;
 const shm_probe_timeout_ms: i32 = 100;
 const shm_name_max = 31;
 const shm_create_retries = 16;
@@ -142,9 +144,45 @@ pub fn renderImage(alloc: std.mem.Allocator, io: std.Io, file: *std.Io.File, wri
     var img = try zigimg.Image.fromFile(allocator, io, file.*, &image_buf);
     defer img.deinit(allocator);
 
-    const original_width = img.width;
-    const original_height = img.height;
+    const fit = fitToWindow(img.width, img.height);
+    const placed = placedSize(img.width, img.height, fit);
 
+    try writer.print("\n     ", .{});
+    if (img.animation.frames.items.len > 1 and animationFits(placed.width, placed.height, img.animation.frames.items.len)) {
+        try transmitAnimation(allocator, io, writer, &img, placed, eligible);
+    } else {
+        try transmitStill(allocator, io, writer, &img, fit, eligible);
+    }
+    try writer.print("\n\n", .{});
+    try writer.flush();
+}
+
+const Fit = struct {
+    width: u32,
+    height: u32,
+};
+
+const Placed = struct {
+    width: u32,
+    height: u32,
+    shrink: bool,
+};
+
+// fitToWindow is the largest size that fits. Images smaller than that stay
+// at their native size, matching the still-image path.
+fn placedSize(src_w: usize, src_h: usize, fit: Fit) Placed {
+    const shrink = fit.width < src_w or fit.height < src_h;
+    if (!shrink) {
+        return .{
+            .width = std.math.cast(u32, src_w) orelse 0,
+            .height = std.math.cast(u32, src_h) orelse 0,
+            .shrink = false,
+        };
+    }
+    return .{ .width = fit.width, .height = fit.height, .shrink = true };
+}
+
+fn fitToWindow(original_width: usize, original_height: usize) Fit {
     var ws_col: u16 = 80;
     var ws_row: u16 = 24;
     var ws_xpixel: u16 = 10 * ws_col;
@@ -162,22 +200,115 @@ pub fn renderImage(alloc: std.mem.Allocator, io: std.Io, file: *std.Io.File, wri
 
     const img_w: f32 = @floatFromInt(original_width);
     const img_h: f32 = @floatFromInt(original_height);
-    const scale_x: f32 = max_pixel_w / img_w;
-    const scale_y: f32 = max_pixel_h / img_h;
-    const scale: f32 = @min(scale_x, scale_y);
+    const scale: f32 = @min(max_pixel_w / img_w, max_pixel_h / img_h);
 
-    const new_w: u32 = @intFromFloat(scale * img_w);
-    const new_h: u32 = @intFromFloat(scale * img_h);
+    return .{
+        .width = @intFromFloat(scale * img_w),
+        .height = @intFromFloat(scale * img_h),
+    };
+}
 
-    try img.convert(allocator, .rgba32);
+fn animationFits(width: u32, height: u32, frame_count: usize) bool {
+    if (frame_count < 2 or width == 0 or height == 0) return false;
+    const pixels = std.math.mul(usize, width, height) catch return false;
+    const frame_bytes = std.math.mul(usize, pixels, 4) catch return false;
+    if (frame_bytes == 0) return false;
+    return frame_count <= animation_rgba_cap / frame_bytes;
+}
 
-    if (new_w < original_width or new_h < original_height) {
-        try resizeImage(allocator, &img, new_w, new_h);
+// Kitty treats a gap of 0 as unset. A GIF delay of 0 is shown for 100 ms.
+fn gapMs(duration_s: f32) u32 {
+    if (!(duration_s > 0)) return zero_delay_gap_ms;
+    const ms = @round(duration_s * 1000.0);
+    if (ms < 1) return 1;
+    const max: f32 = @floatFromInt(std.math.maxInt(u32));
+    if (ms > max) return std.math.maxInt(u32);
+    return @intFromFloat(ms);
+}
+
+// v=1 loops forever. Any other v plays v-1 loops.
+fn kittyLoopCount(loop_count: i32) u32 {
+    if (loop_count < 0) return 1;
+    if (loop_count == 0) return 2;
+    return @as(u32, @intCast(loop_count)) + 1;
+}
+
+const PreparedFrame = struct {
+    pixels: []zigimg.color.Rgba32,
+    owned: bool,
+    gap_ms: u32,
+};
+
+fn prepareFrames(
+    alloc: std.mem.Allocator,
+    img: *const zigimg.Image,
+    placed: Placed,
+) ![]PreparedFrame {
+    const frames = img.animation.frames.items;
+    const prepared = try alloc.alloc(PreparedFrame, frames.len);
+    errdefer alloc.free(prepared);
+    var filled: usize = 0;
+    errdefer {
+        for (prepared[0..filled]) |frame| {
+            if (frame.owned) alloc.free(frame.pixels);
+        }
+    }
+
+    for (frames) |frame| {
+        const source = try frameRgba(alloc, frame.pixels, img.width, img.height);
+        prepared[filled] = .{
+            .pixels = source.pixels,
+            .owned = source.owned,
+            .gap_ms = gapMs(frame.duration),
+        };
+        filled += 1;
+        if (placed.shrink) {
+            const scaled = try resizeRgba(alloc, source.pixels, img.width, img.height, placed.width, placed.height);
+            if (prepared[filled - 1].owned) alloc.free(prepared[filled - 1].pixels);
+            prepared[filled - 1].pixels = scaled;
+            prepared[filled - 1].owned = true;
+        }
+    }
+    return prepared;
+}
+
+fn frameRgba(
+    alloc: std.mem.Allocator,
+    storage: zigimg.color.PixelStorage,
+    width: usize,
+    height: usize,
+) !struct { pixels: []zigimg.color.Rgba32, owned: bool } {
+    const expected = std.math.mul(usize, width, height) catch return error.InvalidData;
+    if (storage == .rgba32) {
+        if (storage.rgba32.len != expected) return error.InvalidData;
+        return .{ .pixels = storage.rgba32, .owned = false };
+    }
+
+    var converted = zigimg.PixelFormatConverter.convert(alloc, &storage, .rgba32) catch return error.InvalidData;
+    if (converted != .rgba32 or converted.rgba32.len != expected) {
+        converted.deinit(alloc);
+        return error.InvalidData;
+    }
+    const pixels = converted.rgba32;
+    converted = .{ .invalid = {} };
+    return .{ .pixels = pixels, .owned = true };
+}
+
+fn transmitStill(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    writer: *std.Io.Writer,
+    img: *zigimg.Image,
+    fit: Fit,
+    eligible: bool,
+) !void {
+    try img.convert(alloc, .rgba32);
+
+    if (fit.width < img.width or fit.height < img.height) {
+        try resizeImage(alloc, img, fit.width, fit.height);
     }
 
     const raw_bytes = std.mem.sliceAsBytes(img.pixels.rgba32);
-
-    try writer.print("\n     ", .{});
     if (raw_bytes.len == 0) return;
 
     var used_shm = false;
@@ -188,12 +319,58 @@ pub fn renderImage(alloc: std.mem.Allocator, io: std.Io, file: *std.Io.File, wri
         };
     }
     if (!used_shm) {
-        var compressed = try compressZlib(allocator, raw_bytes);
-        defer compressed.deinit(allocator);
-        try writeDirectApc(allocator, writer, compressed.items, img.width, img.height);
+        var compressed = try compressZlib(alloc, raw_bytes);
+        defer compressed.deinit(alloc);
+        try writeDirectApc(alloc, writer, compressed.items, img.width, img.height);
     }
-    try writer.print("\n\n", .{});
-    try writer.flush();
+}
+
+fn transmitAnimation(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    writer: *std.Io.Writer,
+    img: *const zigimg.Image,
+    placed: Placed,
+    eligible: bool,
+) !void {
+    const prepared = try prepareFrames(alloc, img, placed);
+    defer {
+        for (prepared) |frame| {
+            if (frame.owned) alloc.free(frame.pixels);
+        }
+        alloc.free(prepared);
+    }
+
+    const image_number = randomImageId(io);
+    const loops = kittyLoopCount(img.animation.loop_count);
+    const use_shm = eligible and shm_support == .yes;
+
+    for (prepared, 0..) |frame, index| {
+        const raw_bytes = std.mem.sliceAsBytes(frame.pixels);
+        const root = index == 0;
+        var used_shm = false;
+        if (use_shm) {
+            used_shm = switch (try transmitFrameShm(io, writer, raw_bytes, placed.width, placed.height, image_number, if (root) null else frame.gap_ms)) {
+                .sent => true,
+                .local_fail => false,
+            };
+        }
+        if (!used_shm) {
+            var compressed = try compressZlib(alloc, raw_bytes);
+            defer compressed.deinit(alloc);
+            try writeFrameDirect(alloc, writer, compressed.items, placed.width, placed.height, image_number, if (root) null else frame.gap_ms);
+        }
+
+        if (index == 0) {
+            try writer.print(
+                "\x1B_Ga=a,I={d},r=1,z={d},v={d},q=2;\x1B\\",
+                .{ image_number, frame.gap_ms, loops },
+            );
+        } else if (index == 1) {
+            try writer.print("\x1B_Ga=a,I={d},s=2,q=2;\x1B\\", .{image_number});
+        }
+    }
+    try writer.print("\x1B_Ga=a,I={d},s=3,q=2;\x1B\\", .{image_number});
 }
 
 fn compressZlib(allocator: std.mem.Allocator, raw: []const u8) !std.ArrayList(u8) {
@@ -376,6 +553,84 @@ fn writeShmApc(
         "\x1B_Gf=32,s={d},v={d},a=T,q=2,t=s,S={d};{s}\x1B\\",
         .{ width, height, data_size, b64 },
     );
+}
+
+fn writeFrameDirect(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    compressed: []const u8,
+    width: u32,
+    height: u32,
+    image_number: u32,
+    gap_ms: ?u32,
+) !void {
+    if (compressed.len == 0) return;
+
+    const out_len = std.base64.standard.Encoder.calcSize(compressed.len);
+    var encoded = try std.ArrayList(u8).initCapacity(allocator, out_len);
+    defer encoded.deinit(allocator);
+    try encoded.resize(allocator, out_len);
+    _ = std.base64.standard.Encoder.encode(encoded.items, compressed);
+
+    const data = encoded.items;
+    var start: usize = 0;
+    while (start < data.len) {
+        const end = @min(start + kitty_chunk_size, data.len);
+        if (start == 0) {
+            if (gap_ms) |gap| {
+                try writer.print(
+                    "\x1B_Gf=32,o=z,s={d},v={d},a=f,I={d},z={d},q=2,m=1;{s}\x1B\\",
+                    .{ width, height, image_number, gap, data[start..end] },
+                );
+            } else {
+                try writer.print(
+                    "\x1B_Gf=32,o=z,s={d},v={d},a=T,I={d},q=2,m=1;{s}\x1B\\",
+                    .{ width, height, image_number, data[start..end] },
+                );
+            }
+        } else if (gap_ms != null) {
+            try writer.print("\x1B_Ga=f,q=2,m=1;{s}\x1B\\", .{data[start..end]});
+        } else {
+            try writer.print("\x1B_Gq=2,m=1;{s}\x1B\\", .{data[start..end]});
+        }
+        start = end;
+    }
+    if (gap_ms != null) {
+        try writer.print("\x1B_Ga=f,q=2,m=0;\x1B\\", .{});
+    } else {
+        try writer.print("\x1B_Gq=2,m=0;\x1B\\", .{});
+    }
+}
+
+fn transmitFrameShm(
+    io: std.Io,
+    writer: *std.Io.Writer,
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+    image_number: u32,
+    gap_ms: ?u32,
+) !TransmitShm {
+    var obj = createShm(io, pixels) catch return .local_fail;
+    obj.unmap();
+    obj.closeFd(io);
+    errdefer obj.unlink(io);
+
+    var b64_buf: [64]u8 = undefined;
+    const b64 = encodeNameB64(obj.posixName(), &b64_buf);
+    if (gap_ms) |gap| {
+        try writer.print(
+            "\x1B_Gf=32,s={d},v={d},a=f,I={d},z={d},q=2,t=s,S={d};{s}\x1B\\",
+            .{ width, height, image_number, gap, pixels.len, b64 },
+        );
+    } else {
+        try writer.print(
+            "\x1B_Gf=32,s={d},v={d},a=T,I={d},q=2,t=s,S={d};{s}\x1B\\",
+            .{ width, height, image_number, pixels.len, b64 },
+        );
+    }
+    try writer.flush();
+    return .sent;
 }
 
 fn transmitShm(
@@ -564,29 +819,44 @@ fn resizeImage(alloc: std.mem.Allocator, img: *zigimg.Image, new_w: u32, new_h: 
         return;
     }
 
-    const img_w_f = @as(f32, @floatFromInt(original_width));
-    const img_h_f = @as(f32, @floatFromInt(original_height));
-    const new_w_f = @as(f32, @floatFromInt(new_w));
-    const new_h_f = @as(f32, @floatFromInt(new_h));
+    const new_pixels = try resizeRgba(alloc, img.pixels.rgba32, original_width, original_height, new_w, new_h);
+    alloc.free(img.pixels.rgba32);
+    img.pixels = .{ .rgba32 = new_pixels };
+    img.width = new_w;
+    img.height = new_h;
+}
 
-    var new_pixels = try alloc.alloc(zigimg.color.Rgba32, new_w * new_h);
+fn resizeRgba(
+    alloc: std.mem.Allocator,
+    src: []const zigimg.color.Rgba32,
+    src_w: usize,
+    src_h: usize,
+    new_w: u32,
+    new_h: u32,
+) ![]zigimg.color.Rgba32 {
+    const img_w_f: f32 = @floatFromInt(src_w);
+    const img_h_f: f32 = @floatFromInt(src_h);
+    const new_w_f: f32 = @floatFromInt(new_w);
+    const new_h_f: f32 = @floatFromInt(new_h);
+
+    const new_pixels = try alloc.alloc(zigimg.color.Rgba32, @as(usize, new_w) * @as(usize, new_h));
 
     for (0..new_h) |y| {
         const sy = @as(f32, @floatFromInt(y)) * img_h_f / new_h_f;
-        const y0 = @as(usize, @intFromFloat(@floor(sy)));
-        const y1 = @min(y0 + 1, original_height - 1);
+        const y0: usize = @intFromFloat(@floor(sy));
+        const y1 = @min(y0 + 1, src_h - 1);
         const dy = sy - @floor(sy);
 
         for (0..new_w) |x| {
             const sx = @as(f32, @floatFromInt(x)) * img_w_f / new_w_f;
-            const x0 = @as(usize, @intFromFloat(@floor(sx)));
-            const x1 = @min(x0 + 1, original_width - 1);
+            const x0: usize = @intFromFloat(@floor(sx));
+            const x1 = @min(x0 + 1, src_w - 1);
             const dx = sx - @floor(sx);
 
-            const p00 = img.pixels.rgba32[@as(usize, y0) * original_width + x0];
-            const p01 = img.pixels.rgba32[@as(usize, y0) * original_width + x1];
-            const p10 = img.pixels.rgba32[@as(usize, y1) * original_width + x0];
-            const p11 = img.pixels.rgba32[@as(usize, y1) * original_width + x1];
+            const p00 = src[y0 * src_w + x0];
+            const p01 = src[y0 * src_w + x1];
+            const p10 = src[y1 * src_w + x0];
+            const p11 = src[y1 * src_w + x1];
 
             new_pixels[y * new_w + x] = .{
                 .r = lerp8(p00.r, p01.r, p10.r, p11.r, dx, dy),
@@ -597,10 +867,7 @@ fn resizeImage(alloc: std.mem.Allocator, img: *zigimg.Image, new_w: u32, new_h: 
         }
     }
 
-    alloc.free(img.pixels.rgba32);
-    img.pixels = .{ .rgba32 = new_pixels };
-    img.width = new_w;
-    img.height = new_h;
+    return new_pixels;
 }
 
 inline fn lerp8(v00: u8, v01: u8, v10: u8, v11: u8, dx: f32, dy: f32) u8 {
@@ -807,6 +1074,60 @@ test "jpeg 4:2:0 restart interval" {
     try expectRgb(px[4 * img.width + 20], 0, 255, 1);
     try expectRgb(px[20 * img.width + 4], 0, 0, 254);
     try expectRgb(px[20 * img.width + 20], 255, 255, 255);
+}
+
+test "animation gap and loop" {
+    try std.testing.expectEqual(@as(u32, 100), gapMs(0));
+    try std.testing.expectEqual(@as(u32, 100), gapMs(-1));
+    try std.testing.expectEqual(@as(u32, 40), gapMs(0.04));
+    try std.testing.expectEqual(@as(u32, 50), gapMs(0.05));
+    try std.testing.expectEqual(@as(u32, 1), kittyLoopCount(-1));
+    try std.testing.expectEqual(@as(u32, 2), kittyLoopCount(0));
+    try std.testing.expectEqual(@as(u32, 4), kittyLoopCount(3));
+}
+
+test "animation does not scale up" {
+    const fit = Fit{ .width = 560, .height = 420 };
+    const placed = placedSize(200, 150, fit);
+    try std.testing.expectEqual(@as(u32, 200), placed.width);
+    try std.testing.expectEqual(@as(u32, 150), placed.height);
+    try std.testing.expect(!placed.shrink);
+
+    const shrunk = placedSize(800, 600, Fit{ .width = 400, .height = 300 });
+    try std.testing.expect(shrunk.shrink);
+    try std.testing.expectEqual(@as(u32, 400), shrunk.width);
+    try std.testing.expectEqual(@as(u32, 300), shrunk.height);
+}
+
+test "animation byte cap" {
+    try std.testing.expect(animationFits(800, 335, 115));
+    try std.testing.expect(!animationFits(800, 335, 400));
+    try std.testing.expect(!animationFits(0, 10, 2));
+    try std.testing.expect(!animationFits(10, 10, 1));
+}
+
+test "animation frame commands" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeFrameDirect(std.testing.allocator, &aw.writer, "rgba", 2, 2, 7, null);
+    try writeFrameDirect(std.testing.allocator, &aw.writer, "rgba", 2, 2, 7, 40);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "a=T,I=7,q=2,m=1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a=f,I=7,z=40,q=2,m=1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b_Ga=f,q=2,m=0;\x1b\\") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "t=s") == null);
+}
+
+test "two-frame gif keeps both frames" {
+    const bytes = @embedFile("fixtures/anim-2x2.gif");
+    var img = try zigimg.Image.fromMemory(std.testing.allocator, bytes);
+    defer img.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), img.width);
+    try std.testing.expectEqual(@as(usize, 2), img.height);
+    try std.testing.expectEqual(@as(usize, 2), img.animation.frames.items.len);
+    try std.testing.expectEqual(@as(i32, -1), img.animation.loop_count);
+    try std.testing.expectEqual(@as(u32, 40), gapMs(img.animation.frames.items[0].duration));
+    try std.testing.expectEqual(@as(u32, 40), gapMs(img.animation.frames.items[1].duration));
 }
 
 fn expectRgb(pixel: zigimg.color.Rgba32, r: u8, g: u8, b: u8) !void {
