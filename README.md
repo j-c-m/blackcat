@@ -5,6 +5,7 @@ A modern `cat`, written in Rust.
 * Kitty graphics protocol, including POSIX shared memory when the terminal can read it
 * ANSI screen rendering, auto-detected
 * CP437 to Unicode, auto-detected
+* Mostly GNU cat compatible otherwise
 
 PCX, IFF, RAS, SGI, and XBM are copied as bytes.
 
