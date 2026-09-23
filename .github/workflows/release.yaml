@@ -23,18 +23,18 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            asset: x86_64-linux
+            asset: linux-x86_64
           - os: ubuntu-26.04-arm
-            asset: aarch64-linux
+            asset: linux-aarch64
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset: aarch64-macos
+            asset: macos-aarch64
           - os: macos-latest
             target: x86_64-apple-darwin
-            asset: x86_64-macos
+            asset: macos-x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-freebsd
-            asset: x86_64-freebsd
+            asset: freebsd-x86_64
             arch: x86_64
     steps:
       - uses: actions/checkout@v4
@@ -120,7 +120,7 @@ jobs:
             rustup target add aarch64-unknown-freebsd
             export CARGO_TARGET_AARCH64_UNKNOWN_FREEBSD_LINKER=aarch64-freebsd-cc
             cargo build --release --target aarch64-unknown-freebsd
-            sh .github/workflows/package.sh aarch64-unknown-freebsd aarch64-freebsd "$TAG"
+            sh .github/workflows/package.sh aarch64-unknown-freebsd freebsd-aarch64 "$TAG"
             rm -rf target
 
       - uses: actions/upload-artifact@v4
