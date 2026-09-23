@@ -30,10 +30,10 @@ jobs:
             target: aarch64-unknown-linux-musl
             asset: aarch64-linux-musl
             zig: aarch64-linux-musl
-          - os: macos-14
+          - os: macos-26
             target: aarch64-apple-darwin
             asset: aarch64-macos
-          - os: macos-14
+          - os: macos-26
             target: x86_64-apple-darwin
             asset: x86_64-macos
           - os: ubuntu-latest
@@ -92,11 +92,13 @@ jobs:
           chmod +x "$linker"
           upper=$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')
           export "CARGO_TARGET_${upper}_LINKER=$linker"
+          # Rust already passes its musl crt objects. Zig's cc adds another crt1.o.
+          export "CARGO_TARGET_${upper}_RUSTFLAGS=-C link-self-contained=-crt"
           cargo build --release --target "$TARGET"
           sh .github/workflows/package.sh "$TARGET" "$ASSET" "$TAG"
 
       - name: Build on macOS
-        if: matrix.os == 'macos-14'
+        if: matrix.os == 'macos-26'
         run: |
           set -euo pipefail
           export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
