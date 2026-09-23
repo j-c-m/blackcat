@@ -24,7 +24,7 @@ jobs:
         include:
           - os: ubuntu-latest
             asset: x86_64-linux
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-26.04-arm
             asset: aarch64-linux
           - os: macos-latest
             target: aarch64-apple-darwin
