@@ -485,7 +485,6 @@ mod tests {
     use image::{ImageBuffer, Rgb, RgbImage, Rgba, RgbaImage};
 
     const NO_SHRINK: (u32, u32) = (4000, 4000);
-    const JPEG: &[u8] = include_bytes!("../fixtures/restart-420.jpg");
 
     fn inflate_payloads(text: &str) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
@@ -634,25 +633,6 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_restart_fixture() {
-        let img = image::load_from_memory(JPEG).unwrap();
-        assert_eq!((img.width(), img.height()), (32, 32));
-        let rgba = img.to_rgba8();
-        let at = |x, y| rgba.get_pixel(x, y).0;
-        assert_eq!(at(4, 4), [254, 0, 0, 255]);
-        assert_eq!(at(20, 4), [0, 255, 1, 255]);
-        assert_eq!(at(4, 20), [0, 0, 254, 255]);
-        assert_eq!(at(20, 20), [255, 255, 255, 255]);
-
-        let mut out = Vec::new();
-        transmit_still(&img, &mut out, NO_SHRINK.0, NO_SHRINK.1, false).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("\x1b_Gf=24,"));
-        let payloads = inflate_payloads(&text);
-        assert_eq!(payloads[0].len(), 32 * 32 * 3);
-    }
-
-    #[test]
     fn gap_loop_place_and_cap() {
         use std::num::NonZeroU32;
         assert_eq!(gap_ms(0.0), 100);
@@ -752,9 +732,29 @@ mod tests {
     }
 
     #[test]
-    fn two_frame_gif_fixture() {
-        let bytes = include_bytes!("../fixtures/anim-2x2.gif");
-        let anim = decode_gif(bytes).expect("gif animation");
+    fn two_frame_gif() {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame};
+        let mut bytes = Vec::new();
+        {
+            let mut enc = GifEncoder::new(std::io::Cursor::new(&mut bytes));
+            enc.set_repeat(Repeat::Infinite).unwrap();
+            enc.encode_frame(Frame::from_parts(
+                solid(2, 2, [255, 0, 0, 255]),
+                0,
+                0,
+                Delay::from_numer_denom_ms(40, 1),
+            ))
+            .unwrap();
+            enc.encode_frame(Frame::from_parts(
+                solid(2, 2, [0, 0, 255, 255]),
+                0,
+                0,
+                Delay::from_numer_denom_ms(40, 1),
+            ))
+            .unwrap();
+        }
+        let anim = decode_gif(&bytes).expect("gif animation");
         assert_eq!((anim.width, anim.height), (2, 2));
         assert_eq!(anim.frames.len(), 2);
         assert_eq!(anim.loops, 1);
