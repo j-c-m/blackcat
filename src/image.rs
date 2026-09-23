@@ -17,20 +17,14 @@ pub fn render(file: &mut File, out: &mut impl Write) -> io::Result<()> {
     file.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
+    if let Some(anim) = decode_animated(&bytes) {
+        return render_frames(anim, out);
+    }
     let img = image::load_from_memory(&bytes)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     let (fit_w, fit_h) = fit_to_window(img.width(), img.height());
     write!(out, "\n     ")?;
     let use_shm = crate::shm::shm_ready();
-    if let Some(anim) = decode_animation(&bytes) {
-        let placed = placed_size(anim.width, anim.height, fit_w, fit_h);
-        if animation_fits(placed.width, placed.height, anim.frames.len()) {
-            transmit_animation(&anim, placed, out, use_shm)?;
-            write!(out, "\n\n")?;
-            out.flush()?;
-            return Ok(());
-        }
-    }
     transmit_still(&img, out, fit_w, fit_h, use_shm)?;
     write!(out, "\n\n")?;
     out.flush()?;
@@ -194,34 +188,81 @@ struct Placed {
     shrink: bool,
 }
 
-fn decode_animation(bytes: &[u8]) -> Option<Anim> {
+fn decode_animated(bytes: &[u8]) -> Option<Anim> {
     match image::guess_format(bytes).ok()? {
-        ImageFormat::Gif => {
-            let decoder = GifDecoder::new(Cursor::new(bytes)).ok()?;
-            let (width, height) = decoder.dimensions();
-            collect_anim(decoder, width, height)
-        }
-        ImageFormat::Png => {
-            let decoder = PngDecoder::new(Cursor::new(bytes)).ok()?;
-            let (width, height) = decoder.dimensions();
-            collect_anim(decoder.apng().ok()?, width, height)
-        }
-        ImageFormat::WebP => {
-            let decoder = WebPDecoder::new(Cursor::new(bytes)).ok()?;
-            let (width, height) = decoder.dimensions();
-            collect_anim(decoder, width, height)
-        }
+        ImageFormat::Gif => decode_gif(bytes),
+        ImageFormat::WebP => decode_webp(bytes),
+        ImageFormat::Png => decode_apng(bytes),
         _ => None,
     }
 }
 
-fn collect_anim<'a, D>(decoder: D, width: u32, height: u32) -> Option<Anim>
+fn render_frames(anim: Anim, out: &mut impl Write) -> io::Result<()> {
+    let (fit_w, fit_h) = fit_to_window(anim.width, anim.height);
+    write!(out, "\n     ")?;
+    let use_shm = crate::shm::shm_ready();
+    let placed = placed_size(anim.width, anim.height, fit_w, fit_h);
+    if anim.frames.len() > 1 && animation_fits(placed.width, placed.height, anim.frames.len()) {
+        transmit_animation(&anim, placed, out, use_shm)?;
+    } else if let Some(frame) = anim.frames.into_iter().next() {
+        let img = DynamicImage::ImageRgba8(frame.into_buffer());
+        transmit_still(&img, out, fit_w, fit_h, use_shm)?;
+    }
+    write!(out, "\n\n")?;
+    out.flush()?;
+    Ok(())
+}
+
+fn decode_gif(bytes: &[u8]) -> Option<Anim> {
+    let decoder = GifDecoder::new(Cursor::new(bytes)).ok()?;
+    let (width, height) = decoder.dimensions();
+    collect_anim(decoder, width, height, 1)
+}
+
+fn decode_webp(bytes: &[u8]) -> Option<Anim> {
+    let decoder = WebPDecoder::new(Cursor::new(bytes)).ok()?;
+    if decoder.has_animation() {
+        let (width, height) = decoder.dimensions();
+        return collect_anim(decoder, width, height, 1);
+    }
+    let (width, height) = decoder.dimensions();
+    let color = decoder.color_type();
+    let nbytes = usize::try_from(decoder.total_bytes()).ok()?;
+    let mut raw = vec![0u8; nbytes];
+    decoder.read_image(&mut raw).ok()?;
+    let rgba = match color {
+        image::ColorType::Rgba8 => image::RgbaImage::from_raw(width, height, raw)?,
+        image::ColorType::Rgb8 => {
+            let rgb = image::RgbImage::from_raw(width, height, raw)?;
+            DynamicImage::ImageRgb8(rgb).to_rgba8()
+        }
+        _ => return None,
+    };
+    let frame = Frame::from_parts(rgba, 0, 0, image::Delay::from_numer_denom_ms(0, 1));
+    Some(Anim {
+        width,
+        height,
+        frames: vec![frame],
+        loops: 1,
+    })
+}
+
+fn decode_apng(bytes: &[u8]) -> Option<Anim> {
+    let decoder = PngDecoder::new(Cursor::new(bytes)).ok()?;
+    if !decoder.is_apng().ok()? {
+        return None;
+    }
+    let (width, height) = decoder.dimensions();
+    collect_anim(decoder.apng().ok()?, width, height, 1)
+}
+
+fn collect_anim<'a, D>(decoder: D, width: u32, height: u32, min_frames: usize) -> Option<Anim>
 where
     D: AnimationDecoder<'a>,
 {
     let loops = kitty_loops(decoder.loop_count());
     let frames = decoder.into_frames().collect_frames().ok()?;
-    if frames.len() < 2 {
+    if frames.len() < min_frames {
         return None;
     }
     Some(Anim {
@@ -713,11 +754,35 @@ mod tests {
     #[test]
     fn two_frame_gif_fixture() {
         let bytes = include_bytes!("../fixtures/anim-2x2.gif");
-        let anim = decode_animation(bytes).expect("gif animation");
+        let anim = decode_gif(bytes).expect("gif animation");
         assert_eq!((anim.width, anim.height), (2, 2));
         assert_eq!(anim.frames.len(), 2);
         assert_eq!(anim.loops, 1);
         assert_eq!(gap_from_delay(anim.frames[0].delay()), 40);
         assert_eq!(gap_from_delay(anim.frames[1].delay()), 40);
+    }
+
+    #[test]
+    fn still_png_skips_animation() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let img = RgbaImage::from_pixel(1, 1, Rgba([1, 2, 3, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        assert!(decode_apng(buf.get_ref()).is_none());
+        assert!(decode_animated(buf.get_ref()).is_none());
+    }
+
+    #[test]
+    fn still_webp_is_one_frame() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let img = RgbaImage::from_pixel(2, 2, Rgba([9, 8, 7, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, image::ImageFormat::WebP)
+            .unwrap();
+        let anim = decode_webp(buf.get_ref()).expect("webp");
+        assert_eq!(anim.frames.len(), 1);
+        assert_eq!((anim.width, anim.height), (2, 2));
+        assert_eq!(anim.frames[0].buffer().get_pixel(0, 0).0, [9, 8, 7, 255]);
     }
 }
