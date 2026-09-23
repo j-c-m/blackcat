@@ -297,7 +297,8 @@ fn flag_after_filename_is_a_filename() {
 fn version_and_help() {
     let version = run(exe(), &strings(&["--version"]));
     assert!(version.status.success());
-    assert_eq!(version.stdout, b"blackcat 0.8.3\n");
+    let expected = format!("blackcat {}\n", env!("CARGO_PKG_VERSION"));
+    assert_eq!(version.stdout, expected.as_bytes());
     let help = run(exe(), &strings(&["--help"]));
     assert!(help.status.success());
     assert!(help.stdout.starts_with(b"USAGE: blackcat "));

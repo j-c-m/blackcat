@@ -1,6 +1,6 @@
 # blackcat
 
-A modern `cat`, written in Rust. Drop-in behavior for the Zig blackcat: Kitty graphics, ANSI art, and CP437, and GNU cat otherwise.
+A modern `cat`, written in Rust.
 
 * Kitty graphics protocol, including POSIX shared memory when the terminal can read it
 * ANSI screen rendering, auto-detected
@@ -10,27 +10,27 @@ PCX, IFF, RAS, SGI, and XBM are copied as bytes.
 
 ## Installation
 
+**Homebrew**
+
 ```bash
-cargo build --release
-# binary: target/release/blackcat
+brew install j-c-m/tap/blackcat
 ```
 
-Release targets:
+**Binaries**
 
-* `x86_64-unknown-linux-musl`
-* `aarch64-unknown-linux-musl`
-* `x86_64-apple-darwin`
-* `aarch64-apple-darwin`
-* `x86_64-unknown-freebsd`
-* `aarch64-unknown-freebsd`
+Archives are on the [latest release](https://github.com/j-c-m/blackcat/releases/latest). Linux archives are glibc builds.
 
-```toml
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-strip = true
-panic = "abort"
+* `blackcat-linux-x86_64`
+* `blackcat-linux-aarch64`
+* `blackcat-macos-x86_64`
+* `blackcat-macos-aarch64`
+* `blackcat-freebsd-x86_64`
+* `blackcat-freebsd-aarch64`
+
+**From source**
+
+```bash
+cargo build --release
 ```
 
 ## Usage

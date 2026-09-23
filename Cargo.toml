@@ -1,8 +1,9 @@
 [package]
 name = "blackcat"
-version = "0.8.3"
+version = "0.9.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/j-c-m/blackcat"
 description = "Modern cat with Kitty graphics, ANSI rendering, and CP437"
 readme = "README.md"
 authors = ["Jesse Miller <https://jmiller.com/>"]
