@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  build:
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: x86_64-linux-musl
+            zig: x86_64-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: aarch64-linux-musl
+            zig: aarch64-linux-musl
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: aarch64-macos
+          - os: macos-14
+            target: x86_64-apple-darwin
+            asset: x86_64-macos
+          - os: ubuntu-latest
+            target: x86_64-unknown-freebsd
+            asset: x86_64-freebsd
+            arch: x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-freebsd
+            asset: aarch64-freebsd
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set release tag or SHA
+        id: set_tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Export package names
+        shell: bash
+        run: |
+          echo "TAG=${{ steps.set_tag.outputs.tag }}" >> "$GITHUB_ENV"
+          echo "ASSET=${{ matrix.asset }}" >> "$GITHUB_ENV"
+          echo "TARGET=${{ matrix.target }}" >> "$GITHUB_ENV"
+
+      - name: Install Zig
+        if: matrix.zig
+        run: |
+          wget -q https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          tar -xf zig-x86_64-linux-0.16.0.tar.xz
+          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !matrix.arch }}
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !matrix.arch }}
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build with Zig as the linker
+        if: matrix.zig
+        env:
+          ZIG_TARGET: ${{ matrix.zig }}
+        run: |
+          set -euo pipefail
+          linker="$RUNNER_TEMP/${TARGET}-cc"
+          printf '%s\n' '#!/bin/sh' "exec zig cc -target ${ZIG_TARGET} \"\$@\"" > "$linker"
+          chmod +x "$linker"
+          upper=$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')
+          export "CARGO_TARGET_${upper}_LINKER=$linker"
+          cargo build --release --target "$TARGET"
+          sh .github/workflows/package.sh "$TARGET" "$ASSET" "$TAG"
+
+      - name: Build on macOS
+        if: matrix.os == 'macos-14'
+        run: |
+          set -euo pipefail
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          cargo build --release --target "$TARGET"
+          sh .github/workflows/package.sh "$TARGET" "$ASSET" "$TAG"
+
+      - name: Build on FreeBSD
+        if: matrix.arch
+        uses: vmactions/freebsd-vm@v1
+        with:
+          arch: ${{ matrix.arch }}
+          mem: "8192"
+          envs: TAG ASSET
+          copyback: true
+          prepare: pkg install -y curl ca_root_nss
+          run: |
+            set -eu
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            . "$HOME/.cargo/env"
+            cargo build --release
+            sh .github/workflows/package.sh native "$ASSET" "$TAG"
+            rm -rf target
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*.tgz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set release tag or SHA
+        id: set_tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Collect archives
+        run: |
+          mkdir -p release
+          find dist -name '*.tgz' -exec cp {} release/ \;
+          ls -l release
+
+      - name: Generate changelog since previous tag
+        run: |
+          set -euo pipefail
+          current_tag="${{ steps.set_tag.outputs.tag }}"
+          prev_tag=""
+          found=""
+          for tag in $(git tag --sort=-creatordate); do
+            if [ "$found" = "yes" ]; then
+              prev_tag="$tag"
+              break
+            fi
+            if [ "$tag" = "$current_tag" ]; then
+              found="yes"
+            fi
+          done
+          echo "## Changelog" > CHANGELOG.md
+          if [ -n "$prev_tag" ]; then
+            git log --pretty=format:"- %s ([%h](https://github.com/${GITHUB_REPOSITORY}/commit/%H))" "$prev_tag..$current_tag" >> CHANGELOG.md
+          else
+            echo "First release or previous tag not found." >> CHANGELOG.md
+          fi
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.tgz
+          body_path: CHANGELOG.md
+          make_latest: true
+          name: blackcat ${{ steps.set_tag.outputs.tag }}
+          tag_name: ${{ steps.set_tag.outputs.tag }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
