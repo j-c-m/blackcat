@@ -23,6 +23,12 @@ const Winsize = extern struct {
 
 const TransmitShm = enum { sent, local_fail };
 
+// f=24 is packed RGB. f=32 is packed RGBA. Opaque pixels use f=24.
+const KittyFormat = enum(u8) {
+    rgb = 24,
+    rgba = 32,
+};
+
 const ProbeParse = enum { need_more, ok, fail, da1 };
 
 const ProbeParser = struct {
@@ -233,10 +239,29 @@ fn kittyLoopCount(loop_count: i32) u32 {
     return @as(u32, @intCast(loop_count)) + 1;
 }
 
+const WirePixels = union(KittyFormat) {
+    rgb: []zigimg.color.Rgb24,
+    rgba: []zigimg.color.Rgba32,
+};
+
 const PreparedFrame = struct {
-    pixels: []zigimg.color.Rgba32,
+    pixels: WirePixels,
     owned: bool,
     gap_ms: u32,
+
+    fn bytes(self: PreparedFrame) []const u8 {
+        return switch (self.pixels) {
+            .rgb => |p| std.mem.sliceAsBytes(p),
+            .rgba => |p| std.mem.sliceAsBytes(p),
+        };
+    }
+
+    fn free(self: PreparedFrame, alloc: std.mem.Allocator) void {
+        switch (self.pixels) {
+            .rgb => |p| alloc.free(p),
+            .rgba => |p| alloc.free(p),
+        }
+    }
 };
 
 fn prepareFrames(
@@ -245,29 +270,31 @@ fn prepareFrames(
     placed: Placed,
 ) ![]PreparedFrame {
     const frames = img.animation.frames.items;
+    var format: KittyFormat = .rgb;
+    for (frames) |frame| {
+        if (try storageNeedsAlpha(alloc, frame.pixels, img.width, img.height)) {
+            format = .rgba;
+            break;
+        }
+    }
+
     const prepared = try alloc.alloc(PreparedFrame, frames.len);
     errdefer alloc.free(prepared);
     var filled: usize = 0;
     errdefer {
         for (prepared[0..filled]) |frame| {
-            if (frame.owned) alloc.free(frame.pixels);
+            if (frame.owned) frame.free(alloc);
         }
     }
 
     for (frames) |frame| {
-        const source = try frameRgba(alloc, frame.pixels, img.width, img.height);
+        const wire = try frameWire(alloc, frame.pixels, img.width, img.height, placed, format);
         prepared[filled] = .{
-            .pixels = source.pixels,
-            .owned = source.owned,
+            .pixels = wire.pixels,
+            .owned = wire.owned,
             .gap_ms = gapMs(frame.duration),
         };
         filled += 1;
-        if (placed.shrink) {
-            const scaled = try resizeRgba(alloc, source.pixels, img.width, img.height, placed.width, placed.height);
-            if (prepared[filled - 1].owned) alloc.free(prepared[filled - 1].pixels);
-            prepared[filled - 1].pixels = scaled;
-            prepared[filled - 1].owned = true;
-        }
     }
     return prepared;
 }
@@ -294,6 +321,125 @@ fn frameRgba(
     return .{ .pixels = pixels, .owned = true };
 }
 
+fn frameRgb(
+    alloc: std.mem.Allocator,
+    storage: zigimg.color.PixelStorage,
+    width: usize,
+    height: usize,
+) !struct { pixels: []zigimg.color.Rgb24, owned: bool } {
+    const expected = std.math.mul(usize, width, height) catch return error.InvalidData;
+    switch (storage) {
+        .rgb24 => |px| {
+            if (px.len != expected) return error.InvalidData;
+            return .{ .pixels = px, .owned = false };
+        },
+        .rgba32 => |px| {
+            if (px.len != expected or !allOpaque(px)) return error.InvalidData;
+            return .{ .pixels = try packRgb(alloc, px), .owned = true };
+        },
+        else => {
+            var converted = zigimg.PixelFormatConverter.convert(alloc, &storage, .rgba32) catch return error.InvalidData;
+            defer converted.deinit(alloc);
+            if (converted != .rgba32 or converted.rgba32.len != expected or !allOpaque(converted.rgba32)) {
+                return error.InvalidData;
+            }
+            return .{ .pixels = try packRgb(alloc, converted.rgba32), .owned = true };
+        },
+    }
+}
+
+fn frameWire(
+    alloc: std.mem.Allocator,
+    storage: zigimg.color.PixelStorage,
+    width: usize,
+    height: usize,
+    placed: Placed,
+    format: KittyFormat,
+) !struct { pixels: WirePixels, owned: bool } {
+    switch (format) {
+        .rgba => {
+            const source = try frameRgba(alloc, storage, width, height);
+            errdefer if (source.owned) alloc.free(source.pixels);
+            if (!placed.shrink) return .{ .pixels = .{ .rgba = source.pixels }, .owned = source.owned };
+            const scaled = try resizeChannels(alloc, zigimg.color.Rgba32, source.pixels, width, height, placed.width, placed.height);
+            if (source.owned) alloc.free(source.pixels);
+            return .{ .pixels = .{ .rgba = scaled }, .owned = true };
+        },
+        .rgb => {
+            const source = try frameRgb(alloc, storage, width, height);
+            errdefer if (source.owned) alloc.free(source.pixels);
+            if (!placed.shrink) return .{ .pixels = .{ .rgb = source.pixels }, .owned = source.owned };
+            const scaled = try resizeChannels(alloc, zigimg.color.Rgb24, source.pixels, width, height, placed.width, placed.height);
+            if (source.owned) alloc.free(source.pixels);
+            return .{ .pixels = .{ .rgb = scaled }, .owned = true };
+        },
+    }
+}
+
+fn storageNeedsAlpha(
+    alloc: std.mem.Allocator,
+    storage: zigimg.color.PixelStorage,
+    width: usize,
+    height: usize,
+) !bool {
+    const expected = std.math.mul(usize, width, height) catch return error.InvalidData;
+    switch (storage) {
+        .rgb24 => |px| {
+            if (px.len != expected) return error.InvalidData;
+            return false;
+        },
+        .rgba32 => |px| {
+            if (px.len != expected) return error.InvalidData;
+            return !allOpaque(px);
+        },
+        else => {
+            var converted = zigimg.PixelFormatConverter.convert(alloc, &storage, .rgba32) catch return error.InvalidData;
+            defer converted.deinit(alloc);
+            if (converted != .rgba32 or converted.rgba32.len != expected) return error.InvalidData;
+            return !allOpaque(converted.rgba32);
+        },
+    }
+}
+
+fn allOpaque(pixels: []const zigimg.color.Rgba32) bool {
+    for (pixels) |px| {
+        if (px.a != 255) return false;
+    }
+    return true;
+}
+
+fn packRgb(alloc: std.mem.Allocator, src: []const zigimg.color.Rgba32) ![]zigimg.color.Rgb24 {
+    const dst = try alloc.alloc(zigimg.color.Rgb24, src.len);
+    for (src, dst) |px, *out| {
+        out.* = .{ .r = px.r, .g = px.g, .b = px.b };
+    }
+    return dst;
+}
+
+fn selectWireFormat(alloc: std.mem.Allocator, img: *zigimg.Image) !KittyFormat {
+    const expected = std.math.mul(usize, img.width, img.height) catch return error.InvalidData;
+    switch (img.pixelFormat()) {
+        .rgb24 => {
+            if (img.pixels.rgb24.len != expected) return error.InvalidData;
+            return .rgb;
+        },
+        .rgba32 => return rgbaWireFormat(alloc, img, expected),
+        else => {
+            try img.convert(alloc, .rgba32);
+            return rgbaWireFormat(alloc, img, expected);
+        },
+    }
+}
+
+fn rgbaWireFormat(alloc: std.mem.Allocator, img: *zigimg.Image, expected: usize) !KittyFormat {
+    if (img.pixelFormat() != .rgba32 or img.pixels.rgba32.len != expected) return error.InvalidData;
+    if (!allOpaque(img.pixels.rgba32)) return .rgba;
+    const rgb = try packRgb(alloc, img.pixels.rgba32);
+    alloc.free(img.pixels.rgba32);
+    img.pixels = .{ .rgb24 = rgb };
+    return .rgb;
+}
+
 fn transmitStill(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -302,18 +448,21 @@ fn transmitStill(
     fit: Fit,
     eligible: bool,
 ) !void {
-    try img.convert(alloc, .rgba32);
+    const format = try selectWireFormat(alloc, img);
 
     if (fit.width < img.width or fit.height < img.height) {
         try resizeImage(alloc, img, fit.width, fit.height);
     }
 
-    const raw_bytes = std.mem.sliceAsBytes(img.pixels.rgba32);
+    const raw_bytes = switch (format) {
+        .rgb => std.mem.sliceAsBytes(img.pixels.rgb24),
+        .rgba => std.mem.sliceAsBytes(img.pixels.rgba32),
+    };
     if (raw_bytes.len == 0) return;
 
     var used_shm = false;
     if (eligible and shm_support == .yes) {
-        used_shm = switch (try transmitShm(io, writer, raw_bytes, img.width, img.height)) {
+        used_shm = switch (try transmitShm(io, writer, raw_bytes, img.width, img.height, format)) {
             .sent => true,
             .local_fail => false,
         };
@@ -321,7 +470,7 @@ fn transmitStill(
     if (!used_shm) {
         var compressed = try compressZlib(alloc, raw_bytes);
         defer compressed.deinit(alloc);
-        try writeDirectApc(alloc, writer, compressed.items, img.width, img.height);
+        try writeDirectApc(alloc, writer, compressed.items, img.width, img.height, format);
     }
 }
 
@@ -336,21 +485,23 @@ fn transmitAnimation(
     const prepared = try prepareFrames(alloc, img, placed);
     defer {
         for (prepared) |frame| {
-            if (frame.owned) alloc.free(frame.pixels);
+            if (frame.owned) frame.free(alloc);
         }
         alloc.free(prepared);
     }
+    if (prepared.len == 0) return;
 
     const image_number = randomImageId(io);
     const loops = kittyLoopCount(img.animation.loop_count);
     const use_shm = eligible and shm_support == .yes;
 
+    const format = std.meta.activeTag(prepared[0].pixels);
     for (prepared, 0..) |frame, index| {
-        const raw_bytes = std.mem.sliceAsBytes(frame.pixels);
+        const raw_bytes = frame.bytes();
         const root = index == 0;
         var used_shm = false;
         if (use_shm) {
-            used_shm = switch (try transmitFrameShm(io, writer, raw_bytes, placed.width, placed.height, image_number, if (root) null else frame.gap_ms)) {
+            used_shm = switch (try transmitFrameShm(io, writer, raw_bytes, placed.width, placed.height, image_number, if (root) null else frame.gap_ms, format)) {
                 .sent => true,
                 .local_fail => false,
             };
@@ -358,7 +509,7 @@ fn transmitAnimation(
         if (!used_shm) {
             var compressed = try compressZlib(alloc, raw_bytes);
             defer compressed.deinit(alloc);
-            try writeFrameDirect(alloc, writer, compressed.items, placed.width, placed.height, image_number, if (root) null else frame.gap_ms);
+            try writeFrameDirect(alloc, writer, compressed.items, placed.width, placed.height, image_number, if (root) null else frame.gap_ms, format);
         }
 
         if (index == 0) {
@@ -374,7 +525,8 @@ fn transmitAnimation(
 }
 
 fn compressZlib(allocator: std.mem.Allocator, raw: []const u8) !std.ArrayList(u8) {
-    var compressed = try std.Io.Writer.Allocating.initCapacity(allocator, raw.len);
+    // flate.Compress requires the output buffer to be longer than 8 bytes.
+    var compressed = try std.Io.Writer.Allocating.initCapacity(allocator, @max(raw.len, 16));
     errdefer compressed.deinit();
 
     var deflate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
@@ -517,6 +669,7 @@ fn writeDirectApc(
     compressed: []const u8,
     width: usize,
     height: usize,
+    format: KittyFormat,
 ) !void {
     if (compressed.len == 0) return;
 
@@ -531,7 +684,7 @@ fn writeDirectApc(
     while (start < data.len) {
         const end = @min(start + kitty_chunk_size, data.len);
         if (start == 0) {
-            try writer.print("\x1B_Gf=32,o=z,s={d},v={d},a=T,q=2,m=1;{s}\x1B\\", .{ width, height, data[start..end] });
+            try writer.print("\x1B_Gf={d},o=z,s={d},v={d},a=T,q=2,m=1;{s}\x1B\\", .{ @intFromEnum(format), width, height, data[start..end] });
         } else {
             try writer.print("\x1B_Gq=2,m=1;{s}\x1B\\", .{data[start..end]});
         }
@@ -546,12 +699,13 @@ fn writeShmApc(
     data_size: usize,
     width: usize,
     height: usize,
+    format: KittyFormat,
 ) !void {
     var b64_buf: [64]u8 = undefined;
     const b64 = encodeNameB64(posix_name, &b64_buf);
     try writer.print(
-        "\x1B_Gf=32,s={d},v={d},a=T,q=2,t=s,S={d};{s}\x1B\\",
-        .{ width, height, data_size, b64 },
+        "\x1B_Gf={d},s={d},v={d},a=T,q=2,t=s,S={d};{s}\x1B\\",
+        .{ @intFromEnum(format), width, height, data_size, b64 },
     );
 }
 
@@ -563,6 +717,7 @@ fn writeFrameDirect(
     height: u32,
     image_number: u32,
     gap_ms: ?u32,
+    format: KittyFormat,
 ) !void {
     if (compressed.len == 0) return;
 
@@ -579,13 +734,13 @@ fn writeFrameDirect(
         if (start == 0) {
             if (gap_ms) |gap| {
                 try writer.print(
-                    "\x1B_Gf=32,o=z,s={d},v={d},a=f,I={d},z={d},q=2,m=1;{s}\x1B\\",
-                    .{ width, height, image_number, gap, data[start..end] },
+                    "\x1B_Gf={d},o=z,s={d},v={d},a=f,I={d},z={d},q=2,m=1;{s}\x1B\\",
+                    .{ @intFromEnum(format), width, height, image_number, gap, data[start..end] },
                 );
             } else {
                 try writer.print(
-                    "\x1B_Gf=32,o=z,s={d},v={d},a=T,I={d},q=2,m=1;{s}\x1B\\",
-                    .{ width, height, image_number, data[start..end] },
+                    "\x1B_Gf={d},o=z,s={d},v={d},a=T,I={d},q=2,m=1;{s}\x1B\\",
+                    .{ @intFromEnum(format), width, height, image_number, data[start..end] },
                 );
             }
         } else if (gap_ms != null) {
@@ -610,6 +765,7 @@ fn transmitFrameShm(
     height: u32,
     image_number: u32,
     gap_ms: ?u32,
+    format: KittyFormat,
 ) !TransmitShm {
     var obj = createShm(io, pixels) catch return .local_fail;
     obj.unmap();
@@ -620,13 +776,13 @@ fn transmitFrameShm(
     const b64 = encodeNameB64(obj.posixName(), &b64_buf);
     if (gap_ms) |gap| {
         try writer.print(
-            "\x1B_Gf=32,s={d},v={d},a=f,I={d},z={d},q=2,t=s,S={d};{s}\x1B\\",
-            .{ width, height, image_number, gap, pixels.len, b64 },
+            "\x1B_Gf={d},s={d},v={d},a=f,I={d},z={d},q=2,t=s,S={d};{s}\x1B\\",
+            .{ @intFromEnum(format), width, height, image_number, gap, pixels.len, b64 },
         );
     } else {
         try writer.print(
-            "\x1B_Gf=32,s={d},v={d},a=T,I={d},q=2,t=s,S={d};{s}\x1B\\",
-            .{ width, height, image_number, pixels.len, b64 },
+            "\x1B_Gf={d},s={d},v={d},a=T,I={d},q=2,t=s,S={d};{s}\x1B\\",
+            .{ @intFromEnum(format), width, height, image_number, pixels.len, b64 },
         );
     }
     try writer.flush();
@@ -639,13 +795,14 @@ fn transmitShm(
     pixels: []const u8,
     width: usize,
     height: usize,
+    format: KittyFormat,
 ) !TransmitShm {
     var obj = createShm(io, pixels) catch return .local_fail;
     obj.unmap();
     obj.closeFd(io);
     errdefer obj.unlink(io);
 
-    try writeShmApc(writer, obj.posixName(), pixels.len, width, height);
+    try writeShmApc(writer, obj.posixName(), pixels.len, width, height, format);
     try writer.flush();
     return .sent;
 }
@@ -808,38 +965,40 @@ fn parseDa1(bytes: []const u8) ?usize {
 }
 
 fn resizeImage(alloc: std.mem.Allocator, img: *zigimg.Image, new_w: u32, new_h: u32) !void {
-    if (img.pixelFormat() != .rgba32) {
-        try img.convert(alloc, .rgba32);
+    if (new_w == img.width and new_h == img.height) return;
+
+    switch (img.pixelFormat()) {
+        .rgb24 => {
+            const scaled = try resizeChannels(alloc, zigimg.color.Rgb24, img.pixels.rgb24, img.width, img.height, new_w, new_h);
+            alloc.free(img.pixels.rgb24);
+            img.pixels = .{ .rgb24 = scaled };
+        },
+        .rgba32 => {
+            const scaled = try resizeChannels(alloc, zigimg.color.Rgba32, img.pixels.rgba32, img.width, img.height, new_w, new_h);
+            alloc.free(img.pixels.rgba32);
+            img.pixels = .{ .rgba32 = scaled };
+        },
+        else => return error.InvalidData,
     }
-
-    const original_width = img.width;
-    const original_height = img.height;
-
-    if (new_w == original_width and new_h == original_height) {
-        return;
-    }
-
-    const new_pixels = try resizeRgba(alloc, img.pixels.rgba32, original_width, original_height, new_w, new_h);
-    alloc.free(img.pixels.rgba32);
-    img.pixels = .{ .rgba32 = new_pixels };
     img.width = new_w;
     img.height = new_h;
 }
 
-fn resizeRgba(
+fn resizeChannels(
     alloc: std.mem.Allocator,
-    src: []const zigimg.color.Rgba32,
+    comptime Pixel: type,
+    src: []const Pixel,
     src_w: usize,
     src_h: usize,
     new_w: u32,
     new_h: u32,
-) ![]zigimg.color.Rgba32 {
+) ![]Pixel {
     const img_w_f: f32 = @floatFromInt(src_w);
     const img_h_f: f32 = @floatFromInt(src_h);
     const new_w_f: f32 = @floatFromInt(new_w);
     const new_h_f: f32 = @floatFromInt(new_h);
 
-    const new_pixels = try alloc.alloc(zigimg.color.Rgba32, @as(usize, new_w) * @as(usize, new_h));
+    const new_pixels = try alloc.alloc(Pixel, @as(usize, new_w) * @as(usize, new_h));
 
     for (0..new_h) |y| {
         const sy = @as(f32, @floatFromInt(y)) * img_h_f / new_h_f;
@@ -858,12 +1017,15 @@ fn resizeRgba(
             const p10 = src[y1 * src_w + x0];
             const p11 = src[y1 * src_w + x1];
 
-            new_pixels[y * new_w + x] = .{
+            var px: Pixel = .{
                 .r = lerp8(p00.r, p01.r, p10.r, p11.r, dx, dy),
                 .g = lerp8(p00.g, p01.g, p10.g, p11.g, dx, dy),
                 .b = lerp8(p00.b, p01.b, p10.b, p11.b, dx, dy),
-                .a = lerp8(p00.a, p01.a, p10.a, p11.a, dx, dy),
             };
+            if (@hasField(Pixel, "a")) {
+                px.a = lerp8(p00.a, p01.a, p10.a, p11.a, dx, dy);
+            }
+            new_pixels[y * new_w + x] = px;
         }
     }
 
@@ -913,7 +1075,7 @@ test "writeDirectApc framing" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
     const payload = "abc";
-    try writeDirectApc(std.testing.allocator, &aw.writer, payload, 2, 3);
+    try writeDirectApc(std.testing.allocator, &aw.writer, payload, 2, 3, .rgba);
     const out = aw.written();
     try std.testing.expect(std.mem.startsWith(u8, out, "\x1b_Gf=32,o=z,s=2,v=3,a=T,q=2,m=1;"));
     try std.testing.expect(std.mem.endsWith(u8, out, "\x1b_Gq=2,m=0;\x1b\\"));
@@ -924,7 +1086,7 @@ test "writeDirectApc framing" {
 test "writeDirectApc empty writes nothing" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
-    try writeDirectApc(std.testing.allocator, &aw.writer, &.{}, 1, 1);
+    try writeDirectApc(std.testing.allocator, &aw.writer, &.{}, 1, 1, .rgba);
     try std.testing.expectEqual(@as(usize, 0), aw.written().len);
 }
 
@@ -932,7 +1094,7 @@ test "writeDirectApc chunks at 4096" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
     const raw = [_]u8{0xaa} ** 4000;
-    try writeDirectApc(std.testing.allocator, &aw.writer, &raw, 10, 10);
+    try writeDirectApc(std.testing.allocator, &aw.writer, &raw, 10, 10, .rgba);
     const out = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b_Gq=2,m=1;") != null);
     var it = std.mem.splitSequence(u8, out, "\x1b_");
@@ -952,7 +1114,7 @@ test "writeShmApc framing" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
     const name = "/bc0000000100000002";
-    try writeShmApc(&aw.writer, name, 12, 4, 5);
+    try writeShmApc(&aw.writer, name, 12, 4, 5, .rgba);
     const out = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "t=s") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "o=z") == null);
@@ -1013,11 +1175,11 @@ test "create-fail returns local_fail then direct" {
     defer resetShmSupportForTest();
 
     const io = std.testing.io;
-    try std.testing.expectEqual(TransmitShm.local_fail, try transmitShm(io, undefined, "zlib", 1, 1));
+    try std.testing.expectEqual(TransmitShm.local_fail, try transmitShm(io, undefined, "zlib", 1, 1, .rgba));
 
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
-    try writeDirectApc(std.testing.allocator, &aw.writer, "zlib", 1, 1);
+    try writeDirectApc(std.testing.allocator, &aw.writer, "zlib", 1, 1, .rgba);
     const out = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "t=s") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "a=T") != null);
@@ -1028,7 +1190,7 @@ test "write-fail does not fall back to direct" {
     if (!shmAvailable()) return error.SkipZigTest;
 
     var failing: std.Io.Writer = .failing;
-    const result = transmitShm(std.testing.io, &failing, "zlib-bytes", 2, 2);
+    const result = transmitShm(std.testing.io, &failing, "zlib-bytes", 2, 2, .rgba);
     try std.testing.expectError(error.WriteFailed, result);
 }
 
@@ -1043,7 +1205,7 @@ test "local shm round-trip" {
 
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
-    try writeShmApc(&aw.writer, obj.posixName(), payload.len, 1, 1);
+    try writeShmApc(&aw.writer, obj.posixName(), payload.len, 1, 1, .rgba);
     const decoded_name = try decodeB64Payload(aw.written());
     defer std.testing.allocator.free(decoded_name);
     try std.testing.expectEqualStrings(obj.posixName(), decoded_name);
@@ -1109,8 +1271,8 @@ test "animation byte cap" {
 test "animation frame commands" {
     var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
-    try writeFrameDirect(std.testing.allocator, &aw.writer, "rgba", 2, 2, 7, null);
-    try writeFrameDirect(std.testing.allocator, &aw.writer, "rgba", 2, 2, 7, 40);
+    try writeFrameDirect(std.testing.allocator, &aw.writer, "rgba", 2, 2, 7, null, .rgba);
+    try writeFrameDirect(std.testing.allocator, &aw.writer, "rgba", 2, 2, 7, 40, .rgba);
     const out = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "a=T,I=7,q=2,m=1;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "a=f,I=7,z=40,q=2,m=1;") != null);
@@ -1135,4 +1297,248 @@ fn expectRgb(pixel: zigimg.color.Rgba32, r: u8, g: u8, b: u8) !void {
     try std.testing.expectEqual(g, pixel.g);
     try std.testing.expectEqual(b, pixel.b);
     try std.testing.expectEqual(@as(u8, 255), pixel.a);
+}
+
+const no_shrink = Fit{ .width = 4000, .height = 4000 };
+
+fn directPixelPayloads(text: []const u8) ![][]u8 {
+    const alloc = std.testing.allocator;
+    var list: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (list.items) |item| alloc.free(item);
+        list.deinit(alloc);
+    }
+
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, text, i, "\x1b_G")) |pos| {
+        const semi = std.mem.indexOfScalarPos(u8, text, pos, ';') orelse break;
+        const end = std.mem.indexOfPos(u8, text, semi, "\x1b\\") orelse break;
+        const control = text[pos..semi];
+        const encoded = text[semi + 1 .. end];
+        i = end + 2;
+        if (encoded.len == 0) continue;
+        if (std.mem.indexOf(u8, control, "o=z") == null) continue;
+        const compressed = try decodeB64Slice(encoded);
+        defer alloc.free(compressed);
+        try list.append(alloc, try inflateZlib(compressed));
+    }
+    return list.toOwnedSlice(alloc);
+}
+
+fn freePayloads(payloads: [][]u8) void {
+    for (payloads) |item| std.testing.allocator.free(item);
+    std.testing.allocator.free(payloads);
+}
+
+fn decodeB64Slice(encoded: []const u8) ![]u8 {
+    const out_len = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+    const out = try std.testing.allocator.alloc(u8, out_len);
+    errdefer std.testing.allocator.free(out);
+    try std.base64.standard.Decoder.decode(out, encoded);
+    return out;
+}
+
+fn inflateZlib(compressed: []const u8) ![]u8 {
+    var input: std.Io.Reader = .fixed(compressed);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress: std.compress.flate.Decompress = .init(&input, .zlib, &window);
+    return decompress.reader.allocRemaining(std.testing.allocator, .limited(8 << 20));
+}
+
+fn countLiteral(haystack: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, i, needle)) |pos| {
+        n += 1;
+        i = pos + needle.len;
+    }
+    return n;
+}
+
+test "opaque rgb sends f=24" {
+    const alloc = std.testing.allocator;
+    var img = try zigimg.Image.create(alloc, 2, 2, .rgb24);
+    defer img.deinit(alloc);
+    const px = [_]zigimg.color.Rgb24{
+        .{ .r = 10, .g = 20, .b = 30 },
+        .{ .r = 40, .g = 50, .b = 60 },
+        .{ .r = 70, .g = 80, .b = 90 },
+        .{ .r = 1, .g = 2, .b = 3 },
+    };
+    @memcpy(img.pixels.rgb24, &px);
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try transmitStill(alloc, std.testing.io, &aw.writer, &img, no_shrink, false);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b_Gf=24,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b_Gf=32,") == null);
+
+    const payloads = try directPixelPayloads(out);
+    defer freePayloads(payloads);
+    try std.testing.expectEqual(@as(usize, 1), payloads.len);
+    try std.testing.expectEqual(@as(usize, 12), payloads[0].len);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&px), payloads[0]);
+}
+
+test "opaque rgba sends f=24" {
+    const alloc = std.testing.allocator;
+    var img = try zigimg.Image.create(alloc, 2, 2, .rgba32);
+    defer img.deinit(alloc);
+    const px = [_]zigimg.color.Rgba32{
+        .{ .r = 10, .g = 20, .b = 30, .a = 255 },
+        .{ .r = 40, .g = 50, .b = 60, .a = 255 },
+        .{ .r = 70, .g = 80, .b = 90, .a = 255 },
+        .{ .r = 1, .g = 2, .b = 3, .a = 255 },
+    };
+    @memcpy(img.pixels.rgba32, &px);
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try transmitStill(alloc, std.testing.io, &aw.writer, &img, no_shrink, false);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b_Gf=24,") != null);
+
+    const payloads = try directPixelPayloads(out);
+    defer freePayloads(payloads);
+    try std.testing.expectEqual(@as(usize, 12), payloads[0].len);
+    const expect = [_]u8{ 10, 20, 30, 40, 50, 60, 70, 80, 90, 1, 2, 3 };
+    try std.testing.expectEqualSlices(u8, &expect, payloads[0]);
+}
+
+test "partial alpha sends f=32" {
+    const alloc = std.testing.allocator;
+    var img = try zigimg.Image.create(alloc, 2, 2, .rgba32);
+    defer img.deinit(alloc);
+    @memset(img.pixels.rgba32, .{ .r = 1, .g = 2, .b = 3, .a = 255 });
+    img.pixels.rgba32[0].a = 0;
+    img.pixels.rgba32[3].a = 128;
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try transmitStill(alloc, std.testing.io, &aw.writer, &img, no_shrink, false);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b_Gf=32,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b_Gf=24,") == null);
+
+    const payloads = try directPixelPayloads(out);
+    defer freePayloads(payloads);
+    try std.testing.expectEqual(@as(usize, 16), payloads[0].len);
+    try std.testing.expectEqual(@as(u8, 0), payloads[0][3]);
+    try std.testing.expectEqual(@as(u8, 128), payloads[0][15]);
+}
+
+test "grayscale sends f=24" {
+    const alloc = std.testing.allocator;
+    var img = try zigimg.Image.create(alloc, 1, 1, .grayscale8);
+    defer img.deinit(alloc);
+    img.pixels.grayscale8[0] = .{ .value = 40 };
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try transmitStill(alloc, std.testing.io, &aw.writer, &img, no_shrink, false);
+    const payloads = try directPixelPayloads(aw.written());
+    defer freePayloads(payloads);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\x1b_Gf=24,") != null);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 40, 40, 40 }, payloads[0]);
+}
+
+test "resized opaque image sends f=24" {
+    const alloc = std.testing.allocator;
+    var img = try zigimg.Image.create(alloc, 4, 4, .rgb24);
+    defer img.deinit(alloc);
+    @memset(img.pixels.rgb24, .{ .r = 11, .g = 22, .b = 33 });
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try transmitStill(alloc, std.testing.io, &aw.writer, &img, .{ .width = 2, .height = 2 }, false);
+    const payloads = try directPixelPayloads(aw.written());
+    defer freePayloads(payloads);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\x1b_Gf=24,") != null);
+    try std.testing.expectEqual(@as(usize, 12), payloads[0].len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 11, 22, 33 }, payloads[0][0..3]);
+}
+
+test "jpeg restart fixture sends f=24" {
+    const alloc = std.testing.allocator;
+    const bytes = @embedFile("fixtures/restart-420.jpg");
+    var img = try zigimg.Image.fromMemory(alloc, bytes);
+    defer img.deinit(alloc);
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    try transmitStill(alloc, std.testing.io, &aw.writer, &img, no_shrink, false);
+    const payloads = try directPixelPayloads(aw.written());
+    defer freePayloads(payloads);
+    try std.testing.expect(std.mem.indexOf(u8, aw.written(), "\x1b_Gf=24,") != null);
+    try std.testing.expectEqual(@as(usize, 32 * 32 * 3), payloads[0].len);
+}
+
+test "opaque animation sends f=24" {
+    const alloc = std.testing.allocator;
+    var img = try zigimg.Image.create(alloc, 2, 2, .rgba32);
+    defer img.deinit(alloc);
+    @memset(img.pixels.rgba32, .{ .r = 5, .g = 6, .b = 7, .a = 255 });
+
+    const second = try zigimg.color.PixelStorage.init(alloc, .rgba32, 4);
+    @memset(second.rgba32, .{ .r = 8, .g = 9, .b = 10, .a = 255 });
+    img.animation.frames = try .initCapacity(alloc, 2);
+    try img.animation.frames.append(alloc, .{ .pixels = img.pixels, .duration = 0.04 });
+    try img.animation.frames.append(alloc, .{ .pixels = second, .duration = 0.04 });
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const placed = placedSize(img.width, img.height, no_shrink);
+    try transmitAnimation(alloc, std.testing.io, &aw.writer, &img, placed, false);
+    const out = aw.written();
+    try std.testing.expectEqual(@as(usize, 2), countLiteral(out, "\x1b_Gf=24,"));
+    try std.testing.expectEqual(@as(usize, 0), countLiteral(out, "\x1b_Gf=32,"));
+
+    const payloads = try directPixelPayloads(out);
+    defer freePayloads(payloads);
+    try std.testing.expectEqual(@as(usize, 2), payloads.len);
+    try std.testing.expectEqual(@as(usize, 12), payloads[0].len);
+    try std.testing.expectEqual(@as(usize, 12), payloads[1].len);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 5, 6, 7 }, payloads[0][0..3]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 8, 9, 10 }, payloads[1][0..3]);
+}
+
+test "animation with one transparent frame sends f=32" {
+    const alloc = std.testing.allocator;
+    var img = try zigimg.Image.create(alloc, 2, 2, .rgb24);
+    defer img.deinit(alloc);
+    @memset(img.pixels.rgb24, .{ .r = 1, .g = 2, .b = 3 });
+
+    const second = try zigimg.color.PixelStorage.init(alloc, .rgba32, 4);
+    @memset(second.rgba32, .{ .r = 4, .g = 5, .b = 6, .a = 255 });
+    second.rgba32[0].a = 0;
+    img.animation.frames = try .initCapacity(alloc, 2);
+    try img.animation.frames.append(alloc, .{ .pixels = img.pixels, .duration = 0.04 });
+    try img.animation.frames.append(alloc, .{ .pixels = second, .duration = 0.04 });
+
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const placed = placedSize(img.width, img.height, no_shrink);
+    try transmitAnimation(alloc, std.testing.io, &aw.writer, &img, placed, false);
+    const out = aw.written();
+    try std.testing.expectEqual(@as(usize, 2), countLiteral(out, "\x1b_Gf=32,"));
+    try std.testing.expectEqual(@as(usize, 0), countLiteral(out, "\x1b_Gf=24,"));
+
+    const payloads = try directPixelPayloads(out);
+    defer freePayloads(payloads);
+    try std.testing.expectEqual(@as(usize, 16), payloads[0].len);
+    try std.testing.expectEqual(@as(usize, 16), payloads[1].len);
+    try std.testing.expectEqual(@as(u8, 255), payloads[0][3]);
+    try std.testing.expectEqual(@as(u8, 0), payloads[1][3]);
+    try std.testing.expectEqual(@as(u8, 4), payloads[1][0]);
+}
+
+test "shm size follows wire format" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeShmApc(&aw.writer, "/bc0000000100000002", 12, 2, 2, .rgb);
+    try writeShmApc(&aw.writer, "/bc0000000100000002", 16, 2, 2, .rgba);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "f=24,s=2,v=2,a=T,q=2,t=s,S=12;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "f=32,s=2,v=2,a=T,q=2,t=s,S=16;") != null);
 }
