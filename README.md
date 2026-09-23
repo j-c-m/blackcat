@@ -1,5 +1,9 @@
 # blackcat
 
+Releases are the Rust build: https://github.com/j-c-m/blackcat
+
+This tree is the Zig implementation: https://github.com/j-c-m/blackcat-zig
+
 A modern cat written in Zig (https://ziglang.org)
 
 * Support Kitty graphics protocol for displaying images in supported terminals. (https://sw.kovidgoyal.net/kitty/graphics-protocol/)
