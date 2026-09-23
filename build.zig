@@ -104,6 +104,38 @@ fn build_cat_compat_test(
     test_step.dependOn(&run_compat.step);
 }
 
+// Upstream zigimg treats a single-component scan as non-interleaved only when
+// the component id is 1. One component is non-interleaved for any id.
+fn patchedZigimgModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const upstream = b.dependency("zigimg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const overlay = b.addWriteFiles();
+    _ = overlay.addCopyFile(b.path("deps/zigimg/src/formats/jpeg/Scan.zig"), "src/formats/jpeg/Scan.zig");
+    _ = overlay.addCopyDirectory(upstream.path(""), "", .{
+        .exclude_extensions = &.{"src/formats/jpeg/Scan.zig"},
+    });
+
+    const module = b.createModule(.{
+        .root_source_file = .{
+            .generated = .{
+                .file = &overlay.generated_directory,
+                .sub_path = "zigimg.zig",
+            },
+        },
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("zigimg", module);
+    return module;
+}
+
 fn build_exe(
     b: *std.Build,
     run_step: *std.Build.Step,
@@ -134,11 +166,7 @@ fn build_exe(
     build_options.addOption([]const u8, "name", @tagName(zon.name));
     exe.root_module.addOptions("build_options", build_options);
 
-    const zigimg_dependency = b.dependency("zigimg", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    exe.root_module.addImport("zigimg", zigimg_dependency.module("zigimg"));
+    exe.root_module.addImport("zigimg", patchedZigimgModule(b, target, optimize));
 
     const exe_install = b.addInstallArtifact(exe, exe_install_options);
     b.getInstallStep().dependOn(&exe_install.step);
