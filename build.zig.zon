@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zigimg = .{
-            .url = "git+https://github.com/zigimg/zigimg.git#b99b9d48899e90ef330f143b096e31cc245ea70a",
-            .hash = "zigimg-0.1.0-8_eo2qgrGADPGfefrNQ9fHU7Xy_5oXEHC7tv3eXDZtc_",
+            .url = "git+https://github.com/zigimg/zigimg.git#5d45034efea2d4812497dc0fabc6c01e95cd40c5",
+            .hash = "zigimg-0.1.0-8_eo2uc-GABoqLy5MtJkyvQWVJnpFu_AlEN-v9s4ZxTM",
         },
     },
     .paths = .{
