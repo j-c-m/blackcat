@@ -36,10 +36,6 @@ jobs:
             target: x86_64-unknown-freebsd
             asset: x86_64-freebsd
             arch: x86_64
-          - os: ubuntu-latest
-            target: aarch64-unknown-freebsd
-            asset: aarch64-freebsd
-            arch: aarch64
     steps:
       - uses: actions/checkout@v4
 
@@ -89,17 +85,42 @@ jobs:
         if: matrix.arch
         uses: vmactions/freebsd-vm@v1
         with:
-          arch: ${{ matrix.arch }}
+          release: "15.1"
+          arch: x86_64
           mem: "8192"
           envs: TAG ASSET
           copyback: true
-          prepare: pkg install -y curl ca_root_nss
+          prepare: pkg install -y curl ca_root_nss llvm
           run: |
             set -eu
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
             . "$HOME/.cargo/env"
             cargo build --release
             sh .github/workflows/package.sh native "$ASSET" "$TAG"
+
+            mkdir -p /opt/freebsd-arm64
+            curl -L --fail -o /tmp/base.txz https://download.freebsd.org/ftp/releases/arm64/aarch64/15.1-RELEASE/base.txz
+            tar -xpf /tmp/base.txz -C /opt/freebsd-arm64
+            rm -f /tmp/base.txz
+            cc=""
+            for c in /usr/local/bin/clang /usr/local/bin/clang21 /usr/local/bin/clang20 /usr/local/bin/clang19 /usr/bin/clang; do
+              if [ -x "$c" ] && "$c" -print-targets 2>/dev/null | grep -q aarch64; then
+                cc=$c
+                break
+              fi
+            done
+            if [ -z "$cc" ]; then
+              echo "no clang with an aarch64 target" >&2
+              exit 1
+            fi
+            mkdir -p "$HOME/bin"
+            printf '%s\n' '#!/bin/sh' "exec $cc --target=aarch64-unknown-freebsd --sysroot=/opt/freebsd-arm64 \"\$@\"" > "$HOME/bin/aarch64-freebsd-cc"
+            chmod +x "$HOME/bin/aarch64-freebsd-cc"
+            export PATH="$HOME/bin:$PATH"
+            rustup target add aarch64-unknown-freebsd
+            export CARGO_TARGET_AARCH64_UNKNOWN_FREEBSD_LINKER=aarch64-freebsd-cc
+            cargo build --release --target aarch64-unknown-freebsd
+            sh .github/workflows/package.sh aarch64-unknown-freebsd aarch64-freebsd "$TAG"
             rm -rf target
 
       - uses: actions/upload-artifact@v4
