@@ -23,13 +23,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            asset: x86_64-linux-musl
-            zig: x86_64-linux-musl
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            asset: aarch64-linux-musl
-            zig: aarch64-linux-musl
+            asset: x86_64-linux
+          - os: ubuntu-24.04-arm
+            asset: aarch64-linux
           - os: macos-latest
             target: aarch64-apple-darwin
             asset: aarch64-macos
@@ -64,13 +60,6 @@ jobs:
           echo "ASSET=${{ matrix.asset }}" >> "$GITHUB_ENV"
           echo "TARGET=${{ matrix.target }}" >> "$GITHUB_ENV"
 
-      - name: Install Zig
-        if: matrix.zig
-        run: |
-          wget -q https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
-          tar -xf zig-x86_64-linux-0.16.0.tar.xz
-          echo "$PWD/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
-
       - uses: dtolnay/rust-toolchain@stable
         if: ${{ !matrix.arch }}
         with:
@@ -79,23 +68,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: ${{ !matrix.arch }}
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.asset }}
 
-      - name: Build with Zig as the linker
-        if: matrix.zig
-        env:
-          ZIG_TARGET: ${{ matrix.zig }}
+      - name: Build on Linux
+        if: ${{ !matrix.arch && matrix.os != 'macos-latest' }}
         run: |
           set -euo pipefail
-          linker="$RUNNER_TEMP/${TARGET}-cc"
-          printf '%s\n' '#!/bin/sh' "exec zig cc -target ${ZIG_TARGET} \"\$@\"" > "$linker"
-          chmod +x "$linker"
-          upper=$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')
-          export "CARGO_TARGET_${upper}_LINKER=$linker"
-          # Rust already passes its musl crt objects. Zig's cc adds another crt1.o.
-          export "CARGO_TARGET_${upper}_RUSTFLAGS=-C link-self-contained=-crt"
-          cargo build --release --target "$TARGET"
-          sh .github/workflows/package.sh "$TARGET" "$ASSET" "$TAG"
+          cargo build --release
+          sh .github/workflows/package.sh native "$ASSET" "$TAG"
 
       - name: Build on macOS
         if: matrix.os == 'macos-latest'
