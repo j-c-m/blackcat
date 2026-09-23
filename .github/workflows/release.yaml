@@ -30,10 +30,10 @@ jobs:
             target: aarch64-unknown-linux-musl
             asset: aarch64-linux-musl
             zig: aarch64-linux-musl
-          - os: macos-26
+          - os: macos-latest
             target: aarch64-apple-darwin
             asset: aarch64-macos
-          - os: macos-26
+          - os: macos-latest
             target: x86_64-apple-darwin
             asset: x86_64-macos
           - os: ubuntu-latest
@@ -98,7 +98,7 @@ jobs:
           sh .github/workflows/package.sh "$TARGET" "$ASSET" "$TAG"
 
       - name: Build on macOS
-        if: matrix.os == 'macos-26'
+        if: matrix.os == 'macos-latest'
         run: |
           set -euo pipefail
           export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
