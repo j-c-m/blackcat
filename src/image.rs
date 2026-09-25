@@ -216,7 +216,24 @@ fn render_frames(anim: Anim, out: &mut impl Write) -> io::Result<()> {
 fn decode_gif(bytes: &[u8]) -> Option<Anim> {
     let decoder = GifDecoder::new(Cursor::new(bytes)).ok()?;
     let (width, height) = decoder.dimensions();
-    collect_anim(decoder, width, height, 1)
+    let loops = kitty_loops(decoder.loop_count());
+    // Stop at the first bad block. Frames already read stay.
+    let mut frames = Vec::new();
+    for frame in decoder.into_frames() {
+        match frame {
+            Ok(frame) => frames.push(frame),
+            Err(_) => break,
+        }
+    }
+    if frames.is_empty() {
+        return None;
+    }
+    Some(Anim {
+        width,
+        height,
+        frames,
+        loops,
+    })
 }
 
 fn decode_webp(bytes: &[u8]) -> Option<Anim> {
@@ -731,35 +748,104 @@ mod tests {
         assert_eq!(payloads[1][0], 4);
     }
 
-    #[test]
-    fn two_frame_gif() {
+    fn two_frame_gif_bytes() -> Vec<u8> {
         use image::codecs::gif::{GifEncoder, Repeat};
         use image::{Delay, Frame};
         let mut bytes = Vec::new();
-        {
-            let mut enc = GifEncoder::new(std::io::Cursor::new(&mut bytes));
-            enc.set_repeat(Repeat::Infinite).unwrap();
-            enc.encode_frame(Frame::from_parts(
-                solid(2, 2, [255, 0, 0, 255]),
-                0,
-                0,
-                Delay::from_numer_denom_ms(40, 1),
-            ))
-            .unwrap();
-            enc.encode_frame(Frame::from_parts(
-                solid(2, 2, [0, 0, 255, 255]),
-                0,
-                0,
-                Delay::from_numer_denom_ms(40, 1),
-            ))
-            .unwrap();
+        let mut enc = GifEncoder::new(std::io::Cursor::new(&mut bytes));
+        enc.set_repeat(Repeat::Infinite).unwrap();
+        enc.encode_frame(Frame::from_parts(
+            solid(2, 2, [255, 0, 0, 255]),
+            0,
+            0,
+            Delay::from_numer_denom_ms(40, 1),
+        ))
+        .unwrap();
+        enc.encode_frame(Frame::from_parts(
+            solid(2, 2, [0, 0, 255, 255]),
+            0,
+            0,
+            Delay::from_numer_denom_ms(40, 1),
+        ))
+        .unwrap();
+        drop(enc);
+        bytes
+    }
+
+    fn second_image_offset(bytes: &[u8]) -> usize {
+        let mut i = 13usize;
+        if bytes[10] & 0x80 != 0 {
+            i += 3 * (1usize << ((bytes[10] & 7) + 1));
         }
-        let anim = decode_gif(&bytes).expect("gif animation");
+        let mut images = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                0x3b => break,
+                0x21 => {
+                    i += 2;
+                    while i < bytes.len() {
+                        let n = bytes[i] as usize;
+                        i += 1;
+                        if n == 0 {
+                            break;
+                        }
+                        i += n;
+                    }
+                }
+                0x2c => {
+                    images += 1;
+                    if images == 2 {
+                        return i;
+                    }
+                    i += 10;
+                    let flags = bytes[i - 1];
+                    if flags & 0x80 != 0 {
+                        i += 3 * (1usize << ((flags & 7) + 1));
+                    }
+                    i += 1;
+                    while i < bytes.len() {
+                        let n = bytes[i] as usize;
+                        i += 1;
+                        if n == 0 {
+                            break;
+                        }
+                        i += n;
+                    }
+                }
+                _ => break,
+            }
+        }
+        panic!("gif has no second image");
+    }
+
+    #[test]
+    fn two_frame_gif() {
+        let anim = decode_gif(&two_frame_gif_bytes()).expect("gif animation");
         assert_eq!((anim.width, anim.height), (2, 2));
         assert_eq!(anim.frames.len(), 2);
         assert_eq!(anim.loops, 1);
         assert_eq!(gap_from_delay(anim.frames[0].delay()), 40);
         assert_eq!(gap_from_delay(anim.frames[1].delay()), 40);
+    }
+
+    #[test]
+    fn gif_trailing_nul_keeps_frames() {
+        let mut bytes = two_frame_gif_bytes();
+        assert_eq!(bytes.last().copied(), Some(0x3b));
+        bytes.insert(bytes.len() - 1, 0);
+        let anim = decode_gif(&bytes).expect("frames before the bad block");
+        assert_eq!(anim.frames.len(), 2);
+        assert_eq!(anim.frames[0].buffer().get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(anim.frames[1].buffer().get_pixel(0, 0).0, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn gif_truncated_later_frame_keeps_earlier_frames() {
+        let bytes = two_frame_gif_bytes();
+        let cut = second_image_offset(&bytes);
+        let anim = decode_gif(&bytes[..cut]).expect("first frame");
+        assert_eq!(anim.frames.len(), 1);
+        assert_eq!(anim.frames[0].buffer().get_pixel(0, 0).0, [255, 0, 0, 255]);
     }
 
     #[test]
